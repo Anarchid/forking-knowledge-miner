@@ -23,9 +23,7 @@ import type {
   ToolCall,
   ToolResult,
 } from '@connectome/agent-framework';
-import type { AgentFramework, Agent } from '@connectome/agent-framework';
-import type { ContextManager } from '@connectome/context-manager';
-import type { ContentBlock } from 'membrane';
+import type { AgentFramework } from '@connectome/agent-framework';
 import { PassthroughStrategy } from '@connectome/agent-framework';
 
 // ---------------------------------------------------------------------------
@@ -355,23 +353,25 @@ export class SubagentModule implements Module {
     };
     this.activeSubagents.set(agentName, entry);
 
-    const { agent, contextManager, cleanup } = await this.getFramework().createEphemeralAgent({
+    const framework = this.getFramework();
+    const { agent, contextManager, cleanup } = await framework.createEphemeralAgent({
       name: agentName,
       model: input.model ?? this.config.defaultModel ?? 'claude-haiku-4-5-20251001',
       systemPrompt: input.systemPrompt,
       maxTokens: input.maxTokens ?? this.config.defaultMaxTokens ?? 4096,
       strategy: new PassthroughStrategy(),
+      allowedTools: this.filterToolNames(input.tools),
     });
 
     try {
       contextManager.addMessage('user', [{ type: 'text', text: input.task }]);
 
-      const allTools = this.getFramework().getAllTools();
-      const tools = this.filterToolsForSubagent(allTools, input.tools);
+      // Run through the framework's event loop — full traces, logging, tool dispatch
+      const { speech, toolCallsCount } = await framework.runEphemeralToCompletion(agent, contextManager);
 
-      const result = await this.driveToCompletion(agent, tools, entry);
       entry.status = 'completed';
-      return result;
+      entry.toolCallsCount = toolCallsCount;
+      return { summary: speech, findings: [], issues: [], toolCallsCount };
     } catch (err) {
       entry.status = 'failed';
       entry.statusMessage = err instanceof Error ? err.message : String(err);
@@ -389,19 +389,22 @@ export class SubagentModule implements Module {
     };
     this.activeSubagents.set(agentName, entry);
 
+    const framework = this.getFramework();
+
     const parentAgent = this.config.parentAgentName
-      ? this.getFramework().getAgent(this.config.parentAgentName)
+      ? framework.getAgent(this.config.parentAgentName)
       : null;
 
     const systemPrompt = input.systemPrompt
       ?? (parentAgent ? parentAgent.systemPrompt : 'You are a research assistant.');
 
-    const { agent, contextManager, cleanup } = await this.getFramework().createEphemeralAgent({
+    const { agent, contextManager, cleanup } = await framework.createEphemeralAgent({
       name: agentName,
       model: input.model ?? this.config.defaultModel ?? 'claude-haiku-4-5-20251001',
       systemPrompt,
       maxTokens: this.config.defaultMaxTokens ?? 4096,
       strategy: new PassthroughStrategy(),
+      allowedTools: this.filterToolNames(),
     });
 
     try {
@@ -414,15 +417,13 @@ export class SubagentModule implements Module {
         }
       }
 
-      // Inject the fork task
       contextManager.addMessage('user', [{ type: 'text', text: input.task }]);
 
-      const allTools = this.getFramework().getAllTools();
-      const tools = this.filterToolsForSubagent(allTools);
+      const { speech, toolCallsCount } = await framework.runEphemeralToCompletion(agent, contextManager);
 
-      const result = await this.driveToCompletion(agent, tools, entry);
       entry.status = 'completed';
-      return result;
+      entry.toolCallsCount = toolCallsCount;
+      return { summary: speech, findings: [], issues: [], toolCallsCount };
     } catch (err) {
       entry.status = 'failed';
       entry.statusMessage = err instanceof Error ? err.message : String(err);
@@ -433,185 +434,22 @@ export class SubagentModule implements Module {
   }
 
   /**
-   * Drive a subagent through its inference loop until it has no more tool calls.
-   *
-   * Works directly with the membrane's YieldingStream. Each inference round:
-   *   1. Start stream (compiles context, sends to LLM)
-   *   2. Iterate events: collect tokens, handle tool calls, detect completion
-   *   3. On tool-calls: execute tools, convert to membrane format, resume stream
-   *   4. On complete: save assistant response, check if more rounds needed
+   * Build the allowedTools list for a subagent.
+   * Removes subagent tools if at depth limit.
    */
-  private async driveToCompletion(
-    agent: Agent,
-    tools: ToolDefinition[],
-    entry?: ActiveSubagent,
-  ): Promise<SubagentResult> {
-    const findings: string[] = [];
-    const issues: string[] = [];
-    let speech = '';
-    let toolCallsCount = 0;
-
-    const MAX_ROUNDS = 20; // Safety limit
-    for (let round = 0; round < MAX_ROUNDS; round++) {
-      const { stream } = await agent.startStreamWithInjections(tools);
-      let hadToolCalls = false;
-
-      for await (const event of stream) {
-        switch (event.type) {
-          case 'tokens':
-            speech += event.content;
-            break;
-
-          case 'tool-calls': {
-            hadToolCalls = true;
-            const calls = event.calls;
-            toolCallsCount += calls.length;
-            if (entry) {
-              entry.toolCallsCount = toolCallsCount;
-              const toolNames = calls.map((c: ToolCall) => c.name.split(':').pop()).join(', ');
-              entry.statusMessage = `calling ${toolNames}`;
-            }
-
-            // Execute each tool call
-            const afResults = await Promise.all(
-              calls.map(async (call: ToolCall) =>
-                this.executeSubagentToolCall(call, findings, issues)
-              )
-            );
-
-            // Store assistant message (tool_use blocks)
-            const assistantBlocks: ContentBlock[] = [];
-            if (event.context.preamble) {
-              assistantBlocks.push({ type: 'text', text: event.context.preamble });
-            }
-            for (const c of calls) {
-              assistantBlocks.push({
-                type: 'tool_use',
-                id: c.id,
-                name: c.name,
-                input: c.input as Record<string, unknown>,
-              });
-            }
-            agent.addAssistantResponse(assistantBlocks);
-
-            // Store tool result message
-            const toolResultContent: ContentBlock[] = calls.map((c: ToolCall, i: number) => ({
-              type: 'tool_result' as const,
-              toolUseId: c.id,
-              content: afResults[i]!.isError
-                ? (afResults[i]!.error ?? 'Unknown error')
-                : JSON.stringify(afResults[i]!.data),
-              isError: afResults[i]!.isError,
-            }));
-            agent.getContextManager().addMessage('user', toolResultContent);
-
-            // Convert to membrane format and resume stream
-            const membraneResults = calls.map((c: ToolCall, i: number) => ({
-              toolUseId: c.id,
-              content: afResults[i]!.isError
-                ? (afResults[i]!.error ?? 'Unknown error')
-                : JSON.stringify(afResults[i]!.data),
-              isError: afResults[i]!.isError,
-            }));
-            stream.provideToolResults(membraneResults);
-            break;
-          }
-
-          case 'complete': {
-            // Store trailing assistant response
-            const response = event.response;
-            if (hadToolCalls) {
-              const trailing = response.content.filter(
-                (block: ContentBlock) => block.type !== 'tool_use' && block.type !== 'tool_result'
-              );
-              if (trailing.length > 0) {
-                agent.addAssistantResponse(trailing);
-              }
-            } else {
-              agent.addAssistantResponse(response.content);
-            }
-            break;
-          }
-
-          case 'error': {
-            const errEvt = event as unknown as { error?: Error | string };
-            const errMsg = errEvt.error instanceof Error ? errEvt.error.message
-              : (errEvt.error ?? 'Unknown inference error');
-            issues.push(errMsg);
-            break;
-          }
-        }
-      }
-
-      // After the stream completes, reset agent to idle
-      agent.reset();
-
-      // If we had no tool calls, inference is truly done
-      if (!hadToolCalls) break;
-    }
-
-    return { summary: speech, findings, issues, toolCallsCount };
-  }
-
-  /**
-   * Execute a tool call for a subagent, intercepting report_* tools.
-   */
-  private async executeSubagentToolCall(
-    call: ToolCall,
-    findings: string[],
-    issues: string[],
-  ): Promise<ToolResult> {
-    const localName = call.name.includes(':')
-      ? call.name.split(':').slice(1).join(':')
-      : call.name;
-
-    // Intercept reporting tools
-    if (localName === 'report_finding' || call.name === 'subagent:report_finding') {
-      const content = (call.input as { content: string }).content;
-      findings.push(content);
-      return { success: true, data: { recorded: true } };
-    }
-    if (localName === 'report_progress' || call.name === 'subagent:report_progress') {
-      // Push to parent queue for TUI display
-      // Progress events are emitted for TUI display but don't require framework routing
-      // For now, just log them — the TUI can observe via trace events
-      // TODO: use a proper custom event type when the AF supports it
-      return { success: true, data: { recorded: true } };
-    }
-
-    // Route to the framework's tool dispatch (handles both modules and MCPL)
-    try {
-      const result = await this.getFramework().executeToolCall(call);
-      return result;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      issues.push(`Tool ${call.name} failed: ${msg}`);
-      return { success: false, error: msg, isError: true };
-    }
-  }
-
-  /**
-   * Filter available tools for a subagent.
-   * Removes subagent tools (to prevent uncontrolled recursion) unless depth allows it.
-   */
-  private filterToolsForSubagent(
-    allTools: ToolDefinition[],
-    allowedTools?: string[],
-  ): ToolDefinition[] {
-    let tools = allTools;
-
-    // Filter to allowed list if specified
-    if (allowedTools) {
-      const allowed = new Set(allowedTools);
-      tools = tools.filter(t => allowed.has(t.name));
-    }
-
-    // Remove subagent spawn/fork tools if at depth limit - 1
-    // (the child is at currentDepth + 1)
+  private filterToolNames(allowedTools?: string[]): 'all' | string[] {
     if (this.currentDepth + 1 >= this.maxDepth) {
-      tools = tools.filter(t => !t.name.startsWith('subagent:'));
+      const allTools = this.getFramework().getAllTools();
+      const filtered = allTools
+        .filter(t => !t.name.startsWith('subagent:'))
+        .map(t => t.name);
+      if (allowedTools) {
+        const allowed = new Set(allowedTools);
+        return filtered.filter(n => allowed.has(n));
+      }
+      return filtered;
     }
-
-    return tools;
+    return allowedTools ?? 'all';
   }
+
 }
