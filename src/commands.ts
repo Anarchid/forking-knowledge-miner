@@ -17,7 +17,8 @@
 
 import type { AgentFramework } from '@connectome/agent-framework';
 import type { ContextManager } from '@connectome/context-manager';
-import type { Line } from './tui/app.js';
+
+export type Line = { text: string; style?: 'user' | 'agent' | 'tool' | 'system' };
 
 // Undo/redo stacks: track (branchId, messageId) pairs for time-travel
 interface StatePoint {

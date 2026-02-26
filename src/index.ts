@@ -4,7 +4,7 @@
  * TUI-driven social knowledge extraction from Zulip.
  *
  * Usage:
- *   npm start                  # Ink TUI mode (requires TTY)
+ *   npm start                  # ANSI TUI mode (requires TTY)
  *   npm start -- --no-tui      # Readline mode (works in pipes/CI)
  *
  * Environment variables:
@@ -87,14 +87,13 @@ async function createFramework(membrane: Membrane) {
 }
 
 // ---------------------------------------------------------------------------
-// Readline mode (--no-tui)
+// Piped/headless mode (--no-tui or non-TTY stdin)
 // ---------------------------------------------------------------------------
 
-async function runReadline(framework: AgentFramework) {
+async function runPiped(framework: AgentFramework) {
   const { createInterface } = await import('node:readline');
   const { handleCommand } = await import('./commands.js');
 
-  // Trace listener: stream tokens and tool calls to stdout
   let inferenceResolve: (() => void) | null = null;
 
   framework.onTrace((event) => {
@@ -123,8 +122,6 @@ async function runReadline(framework: AgentFramework) {
         console.log(`\n[tools] ${calls.map(c => c.name).join(', ')}`);
         break;
       }
-      case 'inference:stream_resumed':
-        break;
       case 'tool:started': {
         const toolInput = e.input ? JSON.stringify(e.input) : '';
         const truncated = toolInput.length > 120 ? toolInput.slice(0, 120) + '...' : toolInput;
@@ -134,111 +131,58 @@ async function runReadline(framework: AgentFramework) {
     }
   });
 
-  /**
-   * Wait for the next inference cycle to complete.
-   * Sets up the promise BEFORE the inference starts, so we don't miss it.
-   */
   function waitForInference(): Promise<void> {
     return new Promise(resolve => {
       inferenceResolve = resolve;
-      // Safety timeout: don't hang forever if inference never starts
       setTimeout(() => {
-        if (inferenceResolve === resolve) {
-          inferenceResolve = null;
-          resolve();
-        }
+        if (inferenceResolve === resolve) { inferenceResolve = null; resolve(); }
       }, 120_000);
     });
   }
 
-  /** Process a single input line. Returns true if should quit. */
   async function processLine(line: string): Promise<boolean> {
     const trimmed = line.trim();
     if (!trimmed) return false;
-
     if (trimmed.startsWith('/')) {
       const result = handleCommand(trimmed, framework);
       if (result.quit) return true;
-      for (const l of result.lines) {
-        console.log(l.text);
-      }
+      for (const l of result.lines) console.log(l.text);
     } else {
       framework.pushEvent({
-        type: 'external-message',
-        source: 'cli',
-        content: trimmed,
-        metadata: {},
-        triggerInference: true,
+        type: 'external-message', source: 'cli',
+        content: trimmed, metadata: {}, triggerInference: true,
       });
-      // Wait for inference to complete before processing next line
       await waitForInference();
     }
     return false;
   }
 
-  // If stdin is a pipe (not TTY), read all lines and process sequentially
+  // Piped: read all then process
   if (!process.stdin.isTTY) {
     const lines: string[] = [];
     const rl = createInterface({ input: process.stdin });
-    for await (const line of rl) {
-      lines.push(line);
-    }
-
+    for await (const line of rl) lines.push(line);
     console.log(`Processing ${lines.length} commands...`);
     for (const line of lines) {
       console.log(`> ${line}`);
-      const quit = await processLine(line);
-      if (quit) break;
+      if (await processLine(line)) break;
     }
-
     console.log('Done.');
     await framework.stop();
     return;
   }
 
-  // Interactive TTY readline
-  const rl = createInterface({
-    input: process.stdin,
-    output: process.stdout,
-    prompt: '> ',
-  });
-
+  // Interactive TTY readline (fallback if --no-tui is explicit on a TTY)
+  const rl = createInterface({ input: process.stdin, output: process.stdout, prompt: '> ' });
   console.log('Zulip Knowledge App (readline mode). Type /help for commands.');
   rl.prompt();
-
   rl.on('line', async (line: string) => {
-    const quit = await processLine(line);
-    if (quit) {
-      rl.close();
-      return;
-    }
+    if (await processLine(line)) { rl.close(); return; }
     rl.prompt();
   });
-
-  await new Promise<void>((resolve) => {
-    rl.on('close', resolve);
-  });
-
+  await new Promise<void>(r => rl.on('close', r));
   console.log('\nShutting down...');
   await framework.stop();
-}
-
-// ---------------------------------------------------------------------------
-// Ink TUI mode
-// ---------------------------------------------------------------------------
-
-async function runTui(framework: AgentFramework) {
-  const React = await import('react');
-  const { render } = await import('ink');
-  const { App } = await import('./tui/app.js');
-
-  const { waitUntilExit } = render(React.createElement(App, { framework }));
-
-  try {
-    await waitUntilExit();
-  } finally {
-    await framework.stop();
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -253,8 +197,9 @@ async function main() {
   framework.start();
 
   if (noTui) {
-    await runReadline(framework);
+    await runPiped(framework);
   } else {
+    const { runTui } = await import('./tui.js');
     await runTui(framework);
   }
 }
