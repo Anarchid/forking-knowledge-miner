@@ -118,7 +118,24 @@ interface LiveSubagentState {
   contextManager: ContextManager;
   currentStream: string;
   pendingToolCalls: Array<{ name: string; input?: unknown }>;
+  /** Track callIds from tool_calls_yielded so we can route tool:* events back. */
+  activeCallIds: Set<string>;
 }
+
+/** Streaming event pushed to peek subscribers. */
+export type SubagentStreamEvent =
+  | { type: 'inference:started' }
+  | { type: 'tokens'; content: string }
+  | { type: 'tool_calls'; calls: Array<{ name: string; input?: unknown }> }
+  | { type: 'tool:started'; tool: string; input?: unknown }
+  | { type: 'tool:completed'; tool: string; durationMs: number }
+  | { type: 'tool:failed'; tool: string; error: string }
+  | { type: 'inference:completed' }
+  | { type: 'inference:failed'; error: string }
+  | { type: 'stream_resumed' }
+  | { type: 'done'; summary: string };
+
+export type SubagentStreamCallback = (event: SubagentStreamEvent) => void;
 
 /** Snapshot returned by peek(). */
 export interface SubagentPeekSnapshot {
@@ -174,6 +191,8 @@ export class SubagentModule implements Module {
   // Live state for peek observability
   private liveSubagents = new Map<string, LiveSubagentState>();          // keyed by displayName
   private frameworkNameIndex = new Map<string, string>();                 // frameworkAgentName → displayName
+  private callIdIndex = new Map<string, string>();                        // toolCallId → displayName
+  private streamSubscribers = new Map<string, Set<SubagentStreamCallback>>();  // displayName → callbacks
 
   constructor(config: SubagentModuleConfig = {}) {
     this.config = config;
@@ -190,34 +209,84 @@ export class SubagentModule implements Module {
   setFramework(framework: AgentFramework): void {
     this.framework = framework;
 
-    // Subscribe to traces for peek observability
+    // Subscribe to traces for peek observability + streaming fanout
     framework.onTrace((event: TraceEvent) => {
+      // Events with agentName: inference lifecycle
       const agentName = 'agentName' in event ? (event as { agentName: string }).agentName : null;
-      if (!agentName) return;
 
-      const displayName = this.frameworkNameIndex.get(agentName);
-      if (!displayName) return;
-      const live = this.liveSubagents.get(displayName);
-      if (!live) return;
+      if (agentName) {
+        const displayName = this.frameworkNameIndex.get(agentName);
+        if (!displayName) return;
+        const live = this.liveSubagents.get(displayName);
+        if (!live) return;
 
-      switch (event.type) {
-        case 'inference:started':
-          live.currentStream = '';
-          live.pendingToolCalls = [];
-          break;
-        case 'inference:tokens':
-          live.currentStream += (event as { content?: string }).content ?? '';
-          break;
-        case 'inference:tool_calls_yielded': {
-          const calls = (event as { calls?: Array<{ name: string; input?: unknown }> }).calls ?? [];
-          live.pendingToolCalls = calls.map(c => ({ name: c.name, input: c.input }));
-          live.currentStream = '';
-          break;
+        switch (event.type) {
+          case 'inference:started':
+            live.currentStream = '';
+            live.pendingToolCalls = [];
+            live.activeCallIds.clear();
+            this.emit(displayName, { type: 'inference:started' });
+            break;
+          case 'inference:tokens': {
+            const content = (event as { content?: string }).content ?? '';
+            live.currentStream += content;
+            this.emit(displayName, { type: 'tokens', content });
+            break;
+          }
+          case 'inference:tool_calls_yielded': {
+            const calls = (event as { calls?: Array<{ id: string; name: string; input?: unknown }> }).calls ?? [];
+            live.pendingToolCalls = calls.map(c => ({ name: c.name, input: c.input }));
+            live.currentStream = '';
+            // Index callIds so we can route tool:* events back
+            for (const c of calls) {
+              live.activeCallIds.add(c.id);
+              this.callIdIndex.set(c.id, displayName);
+            }
+            this.emit(displayName, { type: 'tool_calls', calls: calls.map(c => ({ name: c.name, input: c.input })) });
+            break;
+          }
+          case 'inference:stream_resumed':
+            live.currentStream = '';
+            live.pendingToolCalls = [];
+            this.emit(displayName, { type: 'stream_resumed' });
+            break;
+          case 'inference:completed':
+            this.emit(displayName, { type: 'inference:completed' });
+            break;
+          case 'inference:failed': {
+            const error = (event as { error?: string }).error ?? 'Unknown error';
+            this.emit(displayName, { type: 'inference:failed', error });
+            break;
+          }
         }
-        case 'inference:stream_resumed':
-          live.currentStream = '';
-          live.pendingToolCalls = [];
-          break;
+        return;
+      }
+
+      // Events with callId: tool lifecycle (no agentName)
+      const callId = 'callId' in event ? (event as { callId: string }).callId : null;
+      if (callId) {
+        const displayName = this.callIdIndex.get(callId);
+        if (!displayName) return;
+
+        switch (event.type) {
+          case 'tool:started': {
+            const e = event as { tool: string; input?: unknown };
+            this.emit(displayName, { type: 'tool:started', tool: e.tool, input: e.input });
+            break;
+          }
+          case 'tool:completed': {
+            const e = event as { tool: string; durationMs: number };
+            this.callIdIndex.delete(callId);
+            this.emit(displayName, { type: 'tool:completed', tool: e.tool, durationMs: e.durationMs });
+            break;
+          }
+          case 'tool:failed': {
+            const e = event as { tool: string; error: string };
+            this.callIdIndex.delete(callId);
+            this.emit(displayName, { type: 'tool:failed', tool: e.tool, error: e.error });
+            break;
+          }
+        }
       }
     });
   }
@@ -451,13 +520,54 @@ export class SubagentModule implements Module {
       contextManager,
       currentStream: '',
       pendingToolCalls: [],
+      activeCallIds: new Set(),
     });
     this.frameworkNameIndex.set(frameworkAgentName, displayName);
   }
 
   private unregisterLive(displayName: string, frameworkAgentName: string): void {
+    // Clean up callId index entries for this subagent
+    const live = this.liveSubagents.get(displayName);
+    if (live) {
+      for (const callId of live.activeCallIds) {
+        this.callIdIndex.delete(callId);
+      }
+    }
     this.liveSubagents.delete(displayName);
     this.frameworkNameIndex.delete(frameworkAgentName);
+  }
+
+  /** Fan out a stream event to all subscribers for this subagent + wildcard. */
+  private emit(displayName: string, event: SubagentStreamEvent): void {
+    for (const key of [displayName, '*']) {
+      const subs = this.streamSubscribers.get(key);
+      if (!subs) continue;
+      for (const cb of subs) {
+        try { cb(event); } catch { /* subscriber error — don't break the loop */ }
+      }
+    }
+  }
+
+  /**
+   * Subscribe to a running subagent's live stream. Receives all inference
+   * and tool events as they happen. Returns an unsubscribe function.
+   *
+   * If name is '*', subscribes to events from ALL subagents (events are
+   * the same type — use peek() to get the subagent name if needed).
+   */
+  onPeekStream(name: string, callback: SubagentStreamCallback): () => void {
+    if (!this.streamSubscribers.has(name)) {
+      this.streamSubscribers.set(name, new Set());
+    }
+    this.streamSubscribers.get(name)!.add(callback);
+
+    return () => {
+      const subs = this.streamSubscribers.get(name);
+      if (subs) {
+        subs.delete(callback);
+        if (subs.size === 0) this.streamSubscribers.delete(name);
+      }
+    };
   }
 
   /**
@@ -747,6 +857,7 @@ export class SubagentModule implements Module {
           entry.status = 'completed';
           entry.toolCallsCount = toolCallsCount;
           this.onSubagentSuccess();
+          this.emit(input.name, { type: 'done', summary: speech });
           return { summary: speech, findings: [], issues: [], toolCallsCount };
         } catch (err) {
           lastError = err instanceof Error ? err : new Error(String(err));
@@ -849,6 +960,7 @@ export class SubagentModule implements Module {
           entry.status = 'completed';
           entry.toolCallsCount = toolCallsCount;
           this.onSubagentSuccess();
+          this.emit(input.name, { type: 'done', summary: speech });
           return { summary: speech, findings: [], issues: [], toolCallsCount };
         } catch (err) {
           lastError = err instanceof Error ? err : new Error(String(err));
