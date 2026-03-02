@@ -176,6 +176,10 @@ The agent writes reports to `./output/` and persists lessons in the Chronicle st
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed technical documentation including the agent architecture, module system, retrieval pipeline, and framework integration.
 
+## Known Issues
+
+- **Forked agent context overflow**: Forked subagents inherit the parent's compiled message history. In long sessions, this context can grow past the model's limit, causing the fork's inference to fail. Workaround: use `subagent:spawn` (blank-slate) instead of `subagent:fork` for tasks that don't need parent context, or start a fresh session.
+
 ## Dependencies
 
 | Package | Source | Role |
@@ -185,3 +189,5 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed technical documentation incl
 | `chronicle` | [Anarchid/chronicle](https://github.com/Anarchid/chronicle) | Branchable event store (Rust + N-API) |
 | `membrane` | [Anarchid/membrane](https://github.com/Anarchid/membrane) | LLM provider abstraction |
 | `@opentui/core` | [npm](https://www.npmjs.com/package/@opentui/core) | Terminal UI (Zig native core) |
+
+> **Note:** The framework dependencies currently point to `Anarchid` fork branches for build correctness while upstream PRs are pending. Once the PRs are merged, these should be updated to point to the upstream `antra-tess` / `anima-research` repositories. **TODO**: update `package.json` after PR merge.
