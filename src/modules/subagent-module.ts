@@ -198,6 +198,7 @@ export class SubagentModule implements Module {
   private callIdIndex = new Map<string, string>();                        // toolCallId → displayName
   private streamSubscribers = new Map<string, Set<SubagentStreamCallback>>();  // displayName → callbacks
   private lastInputTokens = new Map<string, number>();  // displayName → last known input token count
+  private cancellationHandles = new Map<string, { reject: (err: Error) => void }>();  // displayName → cancel
 
   constructor(config: SubagentModuleConfig = {}) {
     this.config = config;
@@ -538,6 +539,33 @@ export class SubagentModule implements Module {
       active: this.activeConcurrent,
       queued: this.waitQueue.length,
     };
+  }
+
+  // =========================================================================
+  // Subagent Cancellation
+  // =========================================================================
+
+  /**
+   * Force-stop a running subagent. Aborts the active HTTP stream and
+   * causes runSpawn/runFork to return with a "[Stopped by user]" result.
+   * Returns true if the subagent was found and cancelled.
+   */
+  cancelSubagent(displayName: string): boolean {
+    const handle = this.cancellationHandles.get(displayName);
+    if (!handle) return false;
+
+    // Abort the active inference stream (cancels the HTTP request)
+    const live = this.liveSubagents.get(displayName);
+    if (live) {
+      try {
+        const agent = this.getFramework().getAgent(live.frameworkAgentName);
+        if (agent) agent.cancelStream();
+      } catch { /* best-effort */ }
+    }
+
+    // Unblock the Promise.race in runSpawn/runFork
+    handle.reject(new Error('Cancelled by user'));
+    return true;
   }
 
   // =========================================================================
@@ -887,10 +915,20 @@ export class SubagentModule implements Module {
             );
           }
 
-          let { speech, toolCallsCount } = await this.withTimeout(
-            framework.runEphemeralToCompletion(agent, contextManager),
-            input.name,
-          );
+          // Race execution against both timeout and user cancellation
+          const cancelPromise = new Promise<never>((_, reject) => {
+            this.cancellationHandles.set(input.name, { reject });
+          });
+
+          let { speech, toolCallsCount } = await Promise.race([
+            this.withTimeout(
+              framework.runEphemeralToCompletion(agent, contextManager),
+              input.name,
+            ),
+            cancelPromise,
+          ]);
+
+          this.cancellationHandles.delete(input.name);
 
           // Prefer explicit return over speech capture
           const returned = this.returnedResults.get(input.name);
@@ -909,6 +947,19 @@ export class SubagentModule implements Module {
           return { summary: speech, findings: [], issues: [], toolCallsCount };
         } catch (err) {
           lastError = err instanceof Error ? err : new Error(String(err));
+          this.cancellationHandles.delete(input.name);
+
+          // User-initiated cancellation — return partial output, not a failure
+          if (lastError.message === 'Cancelled by user') {
+            const partial = this.liveSubagents.get(input.name)?.currentStream ?? '';
+            entry.status = 'completed';
+            entry.completedAt = Date.now();
+            entry.statusMessage = 'stopped by user';
+            const summary = '[Stopped by user] ' + (partial || '(no output yet)');
+            this.emit(input.name, { type: 'done', summary, lastInputTokens: this.lastInputTokens.get(input.name) });
+            return { summary, findings: [], issues: [], toolCallsCount: entry.toolCallsCount };
+          }
+
           if (this.isRateLimitError(lastError)) await this.onRateLimitHit();
           if (!this.isTransientError(lastError) || attempt === this.maxRetries) break;
 
@@ -1017,10 +1068,20 @@ export class SubagentModule implements Module {
             );
           }
 
-          let { speech, toolCallsCount } = await this.withTimeout(
-            framework.runEphemeralToCompletion(agent, contextManager),
-            input.name,
-          );
+          // Race execution against both timeout and user cancellation
+          const cancelPromise = new Promise<never>((_, reject) => {
+            this.cancellationHandles.set(input.name, { reject });
+          });
+
+          let { speech, toolCallsCount } = await Promise.race([
+            this.withTimeout(
+              framework.runEphemeralToCompletion(agent, contextManager),
+              input.name,
+            ),
+            cancelPromise,
+          ]);
+
+          this.cancellationHandles.delete(input.name);
 
           // Prefer explicit return over speech capture
           const returned = this.returnedResults.get(input.name);
@@ -1039,6 +1100,19 @@ export class SubagentModule implements Module {
           return { summary: speech, findings: [], issues: [], toolCallsCount };
         } catch (err) {
           lastError = err instanceof Error ? err : new Error(String(err));
+          this.cancellationHandles.delete(input.name);
+
+          // User-initiated cancellation — return partial output, not a failure
+          if (lastError.message === 'Cancelled by user') {
+            const partial = this.liveSubagents.get(input.name)?.currentStream ?? '';
+            entry.status = 'completed';
+            entry.completedAt = Date.now();
+            entry.statusMessage = 'stopped by user';
+            const summary = '[Stopped by user] ' + (partial || '(no output yet)');
+            this.emit(input.name, { type: 'done', summary, lastInputTokens: this.lastInputTokens.get(input.name) });
+            return { summary, findings: [], issues: [], toolCallsCount: entry.toolCallsCount };
+          }
+
           if (this.isRateLimitError(lastError)) await this.onRateLimitHit();
           if (!this.isTransientError(lastError) || attempt === this.maxRetries) break;
 

@@ -418,15 +418,20 @@ export async function runTui(framework: AgentFramework, membrane: Membrane): Pro
     // Fold marker
     const marker = hasChildren ? (isExpanded ? '▼' : '►') : '─';
 
-    // Peek marker for running non-researcher agents
-    const peekMarker = (!node.isResearcher && node.agent?.status === 'running') ? ' [p]' : '';
-
     // Header line (this is a navigable node)
     const isCursor = visibleNodeIds.length === fleetCursor;
     const cursor = isCursor ? '→' : ' ';
     visibleNodeIds.push(node.name);
+
+    // Contextual key hints on the cursor line
+    let hints = '';
+    if (isCursor) {
+      const canPeek = !node.isResearcher && node.agent?.status === 'running';
+      hints = canPeek ? '  ⏎:fold p:peek Del:stop' : '  ⏎:fold';
+    }
+
     lines.push({
-      text: `${cursor} ${indent}${marker} ${node.name}  [${statusTag}]${ctxStr}${compStr}${peekMarker}`,
+      text: `${cursor} ${indent}${marker} ${node.name}  [${statusTag}]${ctxStr}${compStr}${hints}`,
       color: nodeColor,
     });
 
@@ -472,7 +477,7 @@ export async function runTui(framework: AgentFramework, membrane: Membrane): Pro
     visibleNodeIds = [];
 
     const lines: FleetLine[] = [];
-    lines.push({ text: '─── Agent Fleet ────────── ↑↓:nav ⏎:fold p:peek ───', color: GRAY });
+    lines.push({ text: '─── Agent Fleet ──────────────────── ↑↓:nav ───', color: GRAY });
     lines.push({ text: '', color: GRAY });
 
     renderNode(tree, 0, lines);
@@ -480,16 +485,6 @@ export async function runTui(framework: AgentFramework, membrane: Membrane): Pro
     // Clamp cursor
     if (fleetCursor >= visibleNodeIds.length) fleetCursor = visibleNodeIds.length - 1;
     if (fleetCursor < 0) fleetCursor = 0;
-
-    // Status bar hint: if cursor is on a running non-researcher agent, show peek hint
-    const cursorNodeId = visibleNodeIds[fleetCursor];
-    if (cursorNodeId && cursorNodeId !== 'researcher') {
-      const sa = state.subagents.find(s => s.name === cursorNodeId);
-      if (sa?.status === 'running') {
-        lines.push({ text: '', color: GRAY });
-        lines.push({ text: '  ⏎:fold  p:peek', color: CYAN });
-      }
-    }
 
     lines.push({ text: '', color: GRAY });
     lines.push({ text: '                                    Tab: chat', color: DIM_GRAY });
@@ -957,6 +952,16 @@ export async function runTui(framework: AgentFramework, membrane: Membrane): Pro
         const nodeId = visibleNodeIds[fleetCursor];
         if (nodeId && nodeId !== 'researcher') {
           enterPeek(nodeId);
+        }
+      } else if (key.name === 'delete' || key.name === 'backspace') {
+        const nodeId = visibleNodeIds[fleetCursor];
+        if (nodeId && nodeId !== 'researcher') {
+          const sa = state.subagents.find(s => s.name === nodeId);
+          if (sa?.status === 'running' && subMod) {
+            if (subMod.cancelSubagent(nodeId)) {
+              addLine(`  ■ [${nodeId}] stopped by user`, YELLOW);
+            }
+          }
         }
       }
     }
