@@ -1,6 +1,6 @@
-# Zulip Knowledge Miner
+# Forking Knowledge Miner
 
-A TUI-driven application that points an LLM agent at Zulip conversations to extract, organize, and persist structured knowledge. Built on the Afcomech stack (Agent Framework + Context Manager + Membrane + Chronicle) as a dogfooding exercise.
+A TUI-driven application that points forking LLM agents at data sources to extract, organize, and persist structured knowledge. Built on the Afcomech stack (Agent Framework + Context Manager + Membrane + Chronicle) as a dogfooding exercise.
 
 ## Goals
 

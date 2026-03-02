@@ -1,7 +1,7 @@
 /**
- * Zulip Knowledge Extraction App
+ * Forking Knowledge Miner
  *
- * TUI-driven social knowledge extraction from Zulip.
+ * TUI-driven knowledge extraction using forking LLM agents.
  *
  * Usage:
  *   bun src/index.ts            # OpenTUI mode (requires TTY)
@@ -190,7 +190,7 @@ async function runPiped(framework: AgentFramework) {
 
   // Interactive TTY readline (fallback if --no-tui is explicit on a TTY)
   const rl = createInterface({ input: process.stdin, output: process.stdout, prompt: '> ' });
-  console.log('Zulip Knowledge App (readline mode). Type /help for commands.');
+  console.log('Forking Knowledge Miner (readline mode). Type /help for commands.');
   rl.prompt();
   rl.on('line', async (line: string) => {
     if (await processLine(line)) { rl.close(); return; }

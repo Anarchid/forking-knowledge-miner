@@ -1,58 +1,33 @@
-# Zulip Knowledge Miner
+# Forking Knowledge Miner
 
-A TUI-driven tool that points an LLM agent at your Zulip workspace to extract, organize, and persist structured knowledge. The agent reads conversations, identifies decisions, patterns, processes, and key people, and records its findings as persistent lessons with confidence scores and source provenance.
+A TUI-driven tool that points forking LLM agents at data sources to extract, organize, and persist structured knowledge. Connect any MCP/MCPL server as a data source — Zulip, Discord, APIs, databases — and the agent will explore it, fork subagents for parallel analysis, and record findings as persistent lessons with confidence scores and source provenance.
 
-Built on the Connectome agent framework stack as a practical application and dogfooding exercise.
+Built on the Connectome agent framework stack.
 
 ## What it does
 
-- **Reads Zulip**: Connects to your Zulip instance via MCP, browses streams and topics, reads message history
+- **Reads data sources**: Connects to any MCP/MCPL-compatible server — Zulip, Discord, custom APIs
 - **Extracts knowledge**: Identifies decisions, processes, recurring patterns, key people, and technical facts
-- **Parallel exploration**: Forks subagents to analyze multiple streams/topics concurrently, then synthesizes findings
+- **Parallel exploration**: Forks subagents to analyze multiple areas concurrently, then synthesizes findings
 - **Persistent memory**: Stores extracted knowledge as "lessons" with confidence scores, tags, and source references; surfaces relevant lessons before each inference
-- **Produces reports**: Writes analysis reports, team profiles, process maps, and other documents to disk
+- **Produces reports**: Writes analysis reports, profiles, process maps, and other documents to disk
 - **Time-travel**: Chronicle-backed undo/redo, named checkpoints, branch exploration
 
 ## Prerequisites
 
 - [Bun](https://bun.sh/) runtime (not Node.js)
 - An Anthropic API key
-- A Zulip bot account (for API access to your workspace)
-- The [Zulip MCP server](https://github.com/antra-tess/zulip_mcp), cloned and built
+- One or more MCP/MCPL data source servers
 
 ## Setup
 
 ### 1. Install dependencies
 
 ```bash
-cd zulip-app
 bun install
 ```
 
-### 2. Build the Zulip MCP server
-
-```bash
-# Clone alongside the zulip-app directory
-git clone https://github.com/antra-tess/zulip_mcp.git ../zulip-mcp
-cd ../zulip-mcp
-npm install && npm run build
-cd ../zulip-app
-```
-
-### 3. Configure Zulip credentials
-
-Create a `.zuliprc` file in the zulip-app directory (or wherever you'll run from):
-
-```ini
-[api]
-email=your-bot@your-org.zulipchat.com
-key=your-bot-api-key
-site=https://your-org.zulipchat.com
-```
-
-You can generate bot credentials in Zulip under **Settings > Your bots**.
-
-### 4. Set environment variables
+### 2. Set environment variables
 
 ```bash
 cp .env.example .env
@@ -73,9 +48,9 @@ Optional variables:
 | `MODEL` | `claude-opus-4-6` | Model for the main researcher agent |
 | `STORE_PATH` | `./data/store` | Chronicle persistent storage location |
 
-### 5. MCPL server configuration
+### 3. Configure data sources
 
-On first run, the app auto-generates `mcpl-servers.json` with the Zulip server entry. You can also create it manually:
+Data sources are configured in `mcpl-servers.json`, which uses the same format as Claude Code's `.mcp.json`:
 
 ```json
 {
@@ -84,16 +59,45 @@ On first run, the app auto-generates `mcpl-servers.json` with the Zulip server e
       "command": "node",
       "args": ["../zulip-mcp/build/index.js"],
       "env": {
-        "ZULIP_RC_PATH": "./.zuliprc",
-        "ENABLE_ZULIP": "true",
-        "ENABLE_DISCORD": "false"
+        "ZULIP_RC_PATH": "./.zuliprc"
+      }
+    },
+    "discord": {
+      "command": "node",
+      "args": ["--import", "tsx", "../discord-mcpl/src/index.ts", "--stdio"],
+      "env": {
+        "DISCORD_TOKEN": "..."
       }
     }
   }
 }
 ```
 
-Additional MCPL servers (e.g., Discord) can be added here or via the `/mcp` commands at runtime.
+You can also manage servers at runtime with `/mcp` commands (see below). Changes take effect on restart.
+
+Supported fields per server:
+- `command` (required), `args`, `env`
+- `toolPrefix` — customize tool name prefix (default: server ID)
+- `reconnect`, `reconnectIntervalMs` — auto-reconnect on disconnect
+- `enabledFeatureSets`, `disabledFeatureSets`
+
+#### Example: Zulip setup
+
+1. Clone and build the [Zulip MCP server](https://github.com/antra-tess/zulip_mcp):
+   ```bash
+   git clone https://github.com/antra-tess/zulip_mcp.git ../zulip-mcp
+   cd ../zulip-mcp && npm install && npm run build && cd -
+   ```
+
+2. Create a `.zuliprc` with your bot credentials:
+   ```ini
+   [api]
+   email=your-bot@your-org.zulipchat.com
+   key=your-bot-api-key
+   site=https://your-org.zulipchat.com
+   ```
+
+3. Add the server entry to `mcpl-servers.json` as shown above (or let it auto-seed on first run if the legacy `ZULIP_MCP_CMD` env var is set).
 
 ## Running
 
@@ -113,7 +117,7 @@ bun --watch src/index.ts
 
 ## Usage
 
-Type natural language requests in the input bar. The agent will browse Zulip, fork subagents for parallel analysis, and report findings:
+Type natural language requests in the input bar. The agent will explore its data sources, fork subagents for parallel analysis, and report findings:
 
 ```
 > Analyze the last month of #engineering and extract key architectural decisions
@@ -168,26 +172,6 @@ The agent writes reports to `./output/` and persists lessons in the Chronicle st
 | `Esc` | Exit peek mode |
 | `Tab` | Return to chat |
 
-## Adding MCPL Servers
-
-The app supports connecting to any MCPL/MCP-compatible server. For example, to add a Discord server:
-
-```bash
-# Via slash command
-/mcp add discord node --import tsx ../discord-mcpl/src/index.ts --stdio
-/mcp env discord DISCORD_TOKEN=your-token-here
-
-# Or edit mcpl-servers.json directly
-```
-
-Changes to `mcpl-servers.json` take effect on restart.
-
-Supported server config fields:
-- `command` (required), `args`, `env`
-- `toolPrefix` — customize tool name prefix (default: server ID)
-- `reconnect`, `reconnectIntervalMs` — auto-reconnect on disconnect
-- `enabledFeatureSets`, `disabledFeatureSets`
-
 ## Architecture
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed technical documentation including the agent architecture, module system, retrieval pipeline, and framework integration.
@@ -201,4 +185,3 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed technical documentation incl
 | `chronicle` | [Anarchid/chronicle](https://github.com/Anarchid/chronicle) | Branchable event store (Rust + N-API) |
 | `membrane` | [Anarchid/membrane](https://github.com/Anarchid/membrane) | LLM provider abstraction |
 | `@opentui/core` | [npm](https://www.npmjs.com/package/@opentui/core) | Terminal UI (Zig native core) |
-| `zulip-mcp` | [antra-tess/zulip_mcp](https://github.com/antra-tess/zulip_mcp) | Zulip data access via MCP |

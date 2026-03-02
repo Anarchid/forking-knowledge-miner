@@ -110,7 +110,7 @@ export async function runTui(framework: AgentFramework, membrane: Membrane): Pro
   const renderer = await createCliRenderer({ exitOnCtrlC: false });
 
   // Set terminal title
-  process.stdout.write('\x1b]0;Zulip Knowledge Miner\x07');
+  process.stdout.write('\x1b]0;Forking Knowledge Miner\x07');
 
   const state: TuiState = {
     status: 'idle',
@@ -1006,7 +1006,7 @@ export async function runTui(framework: AgentFramework, membrane: Membrane): Pro
 
   // ── Init ───────────────────────────────────────────────────────────
 
-  addLine('Zulip Knowledge App. Type /help for commands.', GRAY);
+  addLine('Forking Knowledge Miner. Type /help for commands.', GRAY);
   addLine(`Error log: ${logPath}`, DIM_GRAY);
   framework.onTrace(onTrace as (e: unknown) => void);
 
