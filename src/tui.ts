@@ -136,6 +136,23 @@ export async function runTui(app: AppContext): Promise<void> {
   let currentStreamBuffer = '';
   let verboseChat = false;
 
+  // Main agent spinner + token counter
+  let streamOutputTokens = 0;
+  let spinnerFrame = 0;
+  const SPINNER = ['·', '.', 'o', 'O'];
+
+  // Subagent phase tracking
+  type SubagentPhase = 'sending' | 'streaming' | 'invoking' | 'executing' | 'done' | 'failed';
+  const subagentPhase = new Map<string, SubagentPhase>();
+  const PHASE_COLOR: Record<SubagentPhase, string> = {
+    sending: YELLOW,
+    streaming: CYAN,
+    invoking: MAGENTA,
+    executing: YELLOW,
+    done: DIM_GRAY,
+    failed: RED,
+  };
+
   // ── Layout ────────────────────────────────────────────────────────────
 
   const rootBox = new BoxRenderable(renderer, {
@@ -276,7 +293,7 @@ export async function runTui(app: AppContext): Promise<void> {
   }
 
   function updateStatus() {
-    statusLeft.content = formatStatusLeft(state);
+    statusLeft.content = formatStatusLeft(state, SPINNER[spinnerFrame], streamOutputTokens);
     statusRight.content = formatTokens(state.tokens, verboseChat);
   }
 
@@ -382,8 +399,12 @@ export async function runTui(app: AppContext): Promise<void> {
       nodeColor = state.status === 'idle' ? GRAY : WHITE;
     } else {
       const sa = node.agent!;
-      nodeColor = sa.status === 'running' ? CYAN
-        : sa.status === 'failed' ? RED : DIM_GRAY;
+      if (sa.status === 'running') {
+        const phase = subagentPhase.get(sa.name) ?? 'sending';
+        nodeColor = PHASE_COLOR[phase];
+      } else {
+        nodeColor = sa.status === 'failed' ? RED : DIM_GRAY;
+      }
     }
 
     // Dimmer variant for detail/child lines
@@ -401,8 +422,12 @@ export async function runTui(app: AppContext): Promise<void> {
       const sa = node.agent!;
       const endTime = sa.completedAt ?? Date.now();
       const elapsed = Math.floor((endTime - sa.startedAt) / 1000);
-      statusTag = sa.status === 'running' ? `running ${elapsed}s`
-        : sa.status === 'completed' ? `done ${elapsed}s` : `failed ${elapsed}s`;
+      if (sa.status !== 'running') {
+        statusTag = sa.status === 'completed' ? `done ${elapsed}s` : `failed ${elapsed}s`;
+      } else {
+        const phase = subagentPhase.get(sa.name) ?? 'sending';
+        statusTag = `${phase} ${elapsed}s`;
+      }
     }
 
     // Context size (try fullName, then short name)
@@ -651,6 +676,8 @@ export async function runTui(app: AppContext): Promise<void> {
       case 'inference:started': {
         if (agent === 'researcher') {
           state.status = 'thinking';
+          streamOutputTokens = 0;
+          spinnerFrame = 0;
           beginStream();
           updateStatus();
         }
@@ -662,6 +689,9 @@ export async function runTui(app: AppContext): Promise<void> {
         if (content) {
           if (agent === 'researcher' && streaming) {
             streamToken(content);
+            streamOutputTokens += Math.ceil(content.length / 4);
+            spinnerFrame = (spinnerFrame + 1) % SPINNER.length;
+            updateStatus();
           }
           if (agent) appendTranscript(agent, content);
         }
@@ -711,6 +741,10 @@ export async function runTui(app: AppContext): Promise<void> {
           addLine(`Error: ${event.error}`, RED);
           updateStatus();
         } else {
+          if (agent) {
+            const short = agent.replace(/^(spawn|fork)-/, '').replace(/-\d+$/, '').replace(/-retry\d+$/, '');
+            subagentPhase.set(short, 'failed');
+          }
           addLine(`[${agent}] Error: ${event.error}`, DIM_GRAY);
         }
         break;
@@ -811,12 +845,14 @@ export async function runTui(app: AppContext): Promise<void> {
     const unsub = subMod.onPeekStream(name, (event) => {
       switch (event.type) {
         case 'inference:started':
+          subagentPhase.set(name, 'sending');
           appendPeekLog(name, '── inference round ──', DIM_GRAY);
           peekCurrentTool.set(name, null);
           peekTokenLine.delete(name);
           break;
 
         case 'tokens': {
+          if (subagentPhase.get(name) !== 'streaming') subagentPhase.set(name, 'streaming');
           // Merge consecutive token events into the last line
           const prev = peekTokenLine.get(name) ?? '';
           const merged = prev + event.content;
@@ -833,6 +869,7 @@ export async function runTui(app: AppContext): Promise<void> {
         }
 
         case 'tool_calls': {
+          subagentPhase.set(name, 'invoking');
           // Flush any pending token line
           const pending = peekTokenLine.get(name);
           if (pending?.trim()) appendPeekLog(name, pending, WHITE);
@@ -843,6 +880,7 @@ export async function runTui(app: AppContext): Promise<void> {
         }
 
         case 'tool:started':
+          subagentPhase.set(name, 'executing');
           peekCurrentTool.set(name, event.tool);
           appendPeekLog(name, `  ⟳ ${event.tool}`, GRAY);
           break;
@@ -858,6 +896,7 @@ export async function runTui(app: AppContext): Promise<void> {
           break;
 
         case 'stream_resumed':
+          subagentPhase.set(name, 'sending');
           appendPeekLog(name, '── stream resumed ──', DIM_GRAY);
           peekCurrentTool.set(name, null);
           peekTokenLine.delete(name);
@@ -867,6 +906,7 @@ export async function runTui(app: AppContext): Promise<void> {
           break;
 
         case 'done': {
+          subagentPhase.set(name, 'done');
           // Flush any pending token line
           const pendingTok = peekTokenLine.get(name);
           if (pendingTok?.trim()) appendPeekLog(name, pendingTok, WHITE);
@@ -892,6 +932,7 @@ export async function runTui(app: AppContext): Promise<void> {
       }
 
       if (state.viewMode === 'peek' && state.peekTarget === name) updatePeekView();
+      if (state.viewMode === 'fleet') updateFleetView();
     });
     subagentStreamUnsubs.push(unsub);
   }
@@ -1081,9 +1122,17 @@ export async function runTui(app: AppContext): Promise<void> {
 // Status bar formatter
 // ---------------------------------------------------------------------------
 
-function formatStatusLeft(state: TuiState): string {
+function formatStatusLeft(
+  state: TuiState,
+  spinnerChar?: string,
+  outputTokens?: number,
+): string {
   const sColor = state.status === 'idle' ? '✓' : state.status === 'error' ? '✗' : '…';
   let bar = `[${sColor} ${state.status}`;
+  if (state.status === 'thinking' && spinnerChar !== undefined && outputTokens !== undefined) {
+    const tokStr = outputTokens >= 1000 ? (outputTokens / 1000).toFixed(1) + 'k' : String(outputTokens);
+    bar += ` ${spinnerChar} ${tokStr} tok`;
+  }
   if (state.tool) bar += ` | ${state.tool}`;
   const running = state.subagents.filter(s => s.status === 'running').length;
   if (running > 0) {
