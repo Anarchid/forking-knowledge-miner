@@ -14,12 +14,20 @@
  *   /clear         — Clear conversation display
  *   /mcp list|add|remove|env — Manage MCPL server config
  *   /budget [N]    — Show/set stream token budget (e.g. /budget 1m)
+ *   /session       — Session management (list, new, switch, rename, delete)
  *   /help          — List commands
  */
 
 import type { AgentFramework } from '@connectome/agent-framework';
 import type { ContextManager } from '@connectome/context-manager';
 import { readMcplServersFile, saveMcplServers, DEFAULT_CONFIG_PATH } from './mcpl-config.js';
+
+/** Imported lazily to avoid circular deps — index.ts re-exports the type. */
+interface AppContext {
+  framework: AgentFramework;
+  sessionManager: import('./session-manager.js').SessionManager;
+  switchSession(id: string): Promise<void>;
+}
 
 export type Line = { text: string; style?: 'user' | 'agent' | 'tool' | 'system' };
 
@@ -39,6 +47,8 @@ const checkpoints = new Map<string, StatePoint>();
 export interface CommandResult {
   lines: Line[];
   quit?: boolean;
+  /** Session ID to switch to — caller performs the async switch. */
+  switchToSessionId?: string;
 }
 
 /**
@@ -49,10 +59,11 @@ function getAgentCM(framework: AgentFramework, agentName = 'researcher'): Contex
   return agent?.getContextManager() ?? null;
 }
 
-export function handleCommand(command: string, framework: AgentFramework): CommandResult {
+export function handleCommand(command: string, app: AppContext): CommandResult {
   const parts = command.slice(1).split(/\s+/);
   const cmd = parts[0]!;
   const args = parts.slice(1);
+  const framework = app.framework;
 
   switch (cmd) {
     case 'quit':
@@ -79,6 +90,12 @@ export function handleCommand(command: string, framework: AgentFramework): Comma
           { text: '  /mcp remove <id>       Remove a server', style: 'system' },
           { text: '  /mcp env <id> K=V ...  Set env vars on server', style: 'system' },
           { text: '  /budget [tokens]       Show/set stream token budget', style: 'system' },
+          { text: '  /session               Show current session', style: 'system' },
+          { text: '  /session list          List all sessions', style: 'system' },
+          { text: '  /session new [name]    Create new session', style: 'system' },
+          { text: '  /session switch <name> Switch to session', style: 'system' },
+          { text: '  /session rename <name> Rename current session', style: 'system' },
+          { text: '  /session delete <name> Delete a session', style: 'system' },
         ],
       };
 
@@ -118,12 +135,161 @@ export function handleCommand(command: string, framework: AgentFramework): Comma
     case 'budget':
       return handleBudget(framework, args[0]);
 
+    case 'session':
+      return handleSession(app, args);
+
     default:
       return {
         lines: [{ text: `Unknown command: /${cmd}. Type /help.`, style: 'system' }],
       };
   }
 }
+
+// ---------------------------------------------------------------------------
+// /session subcommands
+// ---------------------------------------------------------------------------
+
+function handleSession(app: AppContext, args: string[]): CommandResult {
+  const sub = args[0];
+  switch (sub) {
+    case undefined:
+      return handleSessionInfo(app);
+    case 'list':
+    case 'ls':
+      return handleSessionList(app);
+    case 'new':
+    case 'create':
+      return handleSessionNew(app, args.slice(1).join(' ') || undefined);
+    case 'switch':
+    case 'sw':
+      return handleSessionSwitch(app, args[1]);
+    case 'rename':
+      return handleSessionRename(app, args.slice(1).join(' ') || undefined);
+    case 'delete':
+    case 'rm':
+      return handleSessionDelete(app, args[1]);
+    default:
+      return { lines: [{ text: `Unknown /session subcommand: ${sub}. Try /session list.`, style: 'system' }] };
+  }
+}
+
+function handleSessionInfo(app: AppContext): CommandResult {
+  const session = app.sessionManager.getActiveSession();
+  if (!session) {
+    return { lines: [{ text: 'No active session.', style: 'system' }] };
+  }
+
+  const lines: Line[] = [
+    { text: '--- Current Session ---', style: 'system' },
+    { text: `  Name: ${session.name}${session.manuallyNamed ? '' : ' (auto)'}`, style: 'system' },
+    { text: `  ID: ${session.id}`, style: 'system' },
+    { text: `  Created: ${session.createdAt}`, style: 'system' },
+    { text: `  Last accessed: ${session.lastAccessedAt}`, style: 'system' },
+  ];
+
+  if (session.messageCount !== undefined) {
+    lines.push({ text: `  Messages: ${session.messageCount}`, style: 'system' });
+  }
+
+  return { lines };
+}
+
+function handleSessionList(app: AppContext): CommandResult {
+  const sessions = app.sessionManager.listSessions();
+  const active = app.sessionManager.getActiveSession();
+
+  if (sessions.length === 0) {
+    return { lines: [{ text: 'No sessions.', style: 'system' }] };
+  }
+
+  const lines: Line[] = [{ text: `--- Sessions (${sessions.length}) ---`, style: 'system' }];
+  for (const s of sessions) {
+    const marker = s.id === active?.id ? ' *' : '';
+    const msgs = s.messageCount !== undefined ? ` (${s.messageCount} msgs)` : '';
+    const naming = s.manuallyNamed ? '' : ' (auto)';
+    lines.push({
+      text: `  ${s.name}${naming} [${s.id}]${msgs}${marker}`,
+      style: 'system',
+    });
+  }
+
+  return { lines };
+}
+
+function handleSessionNew(app: AppContext, name?: string): CommandResult {
+  const session = app.sessionManager.createSession(name);
+
+  // Clear per-session undo/redo/checkpoint state
+  undoStack.length = 0;
+  redoStack.length = 0;
+  checkpoints.clear();
+
+  return {
+    lines: [{ text: `Switching to new session: ${session.name} [${session.id}]...`, style: 'system' }],
+    switchToSessionId: session.id,
+  };
+}
+
+function handleSessionSwitch(app: AppContext, nameOrId?: string): CommandResult {
+  if (!nameOrId) {
+    return { lines: [{ text: 'Usage: /session switch <name or id>', style: 'system' }] };
+  }
+
+  const session = app.sessionManager.findSession(nameOrId);
+  if (!session) {
+    return { lines: [{ text: `Session "${nameOrId}" not found. Use /session list.`, style: 'system' }] };
+  }
+
+  const active = app.sessionManager.getActiveSession();
+  if (active && session.id === active.id) {
+    return { lines: [{ text: `Already on session "${session.name}".`, style: 'system' }] };
+  }
+
+  undoStack.length = 0;
+  redoStack.length = 0;
+  checkpoints.clear();
+
+  return {
+    lines: [{ text: `Switching to session: ${session.name} [${session.id}]...`, style: 'system' }],
+    switchToSessionId: session.id,
+  };
+}
+
+function handleSessionRename(app: AppContext, name?: string): CommandResult {
+  if (!name) {
+    return { lines: [{ text: 'Usage: /session rename <name>', style: 'system' }] };
+  }
+
+  const session = app.sessionManager.getActiveSession();
+  if (!session) {
+    return { lines: [{ text: 'No active session.', style: 'system' }] };
+  }
+
+  app.sessionManager.renameSession(session.id, name);
+  return { lines: [{ text: `Session renamed to "${name}".`, style: 'system' }] };
+}
+
+function handleSessionDelete(app: AppContext, nameOrId?: string): CommandResult {
+  if (!nameOrId) {
+    return { lines: [{ text: 'Usage: /session delete <name or id>', style: 'system' }] };
+  }
+
+  const session = app.sessionManager.findSession(nameOrId);
+  if (!session) {
+    return { lines: [{ text: `Session "${nameOrId}" not found.`, style: 'system' }] };
+  }
+
+  try {
+    app.sessionManager.deleteSession(session.id);
+    return { lines: [{ text: `Deleted session "${session.name}" [${session.id}].`, style: 'system' }] };
+  } catch (err) {
+    return { lines: [{ text: `Delete failed: ${err instanceof Error ? err.message : err}`, style: 'system' }] };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Existing handlers (unchanged logic, take framework directly)
+// ---------------------------------------------------------------------------
 
 function handleStatus(framework: AgentFramework): CommandResult {
   const agents = framework.getAllAgents();

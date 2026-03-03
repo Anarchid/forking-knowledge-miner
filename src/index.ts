@@ -11,8 +11,8 @@
  *   ANTHROPIC_API_KEY   - Required
  *   ZULIP_MCP_CMD       - Path to Zulip MCP server (default: node ../zulip-mcp/build/index.js)
  *   ZULIP_RC_PATH       - Path to .zuliprc file (for Zulip MCP)
- *   MODEL               - Model to use (default: claude-sonnet-4-5-20250929)
- *   STORE_PATH          - Chronicle store path (default: ./data/store)
+ *   MODEL               - Model to use (default: claude-opus-4-6)
+ *   DATA_DIR            - Data directory for sessions (default: ./data)
  */
 
 import { Membrane, AnthropicAdapter, NativeFormatter } from 'membrane';
@@ -26,6 +26,10 @@ import { LessonsModule } from './modules/lessons-module.js';
 import { RetrievalModule } from './modules/retrieval-module.js';
 import { TuiModule } from './modules/tui-module.js';
 import { loadMcplServers, saveMcplServers, DEFAULT_CONFIG_PATH } from './mcpl-config.js';
+import { SessionManager } from './session-manager.js';
+import { generateSessionName } from './synesthete.js';
+
+export type { AppContext };
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -34,13 +38,31 @@ const noTui = process.argv.includes('--no-tui') || !process.stdin.isTTY;
 const config = {
   apiKey: process.env.ANTHROPIC_API_KEY,
   model: process.env.MODEL || 'claude-opus-4-6',
-  storePath: process.env.STORE_PATH || './data/store',
+  dataDir: process.env.DATA_DIR || './data',
 };
 
 if (!config.apiKey) {
   console.error('Missing ANTHROPIC_API_KEY. Set it in .env or environment.');
   process.exit(1);
 }
+
+// ---------------------------------------------------------------------------
+// AppContext — mutable container for session switching
+// ---------------------------------------------------------------------------
+
+interface AppContext {
+  framework: AgentFramework;
+  membrane: Membrane;
+  sessionManager: SessionManager;
+  userMessageCount: number;
+
+  /** Stop current framework, switch to a different session, start new framework. */
+  switchSession(id: string): Promise<void>;
+}
+
+// ---------------------------------------------------------------------------
+// Framework factory
+// ---------------------------------------------------------------------------
 
 /**
  * Seed mcpl-servers.json on first run using legacy env vars.
@@ -64,7 +86,7 @@ function seedMcplConfig(): void {
   });
 }
 
-async function createFramework(membrane: Membrane) {
+async function createFramework(membrane: Membrane, storePath: string): Promise<AgentFramework> {
   seedMcplConfig();
   const mcplServers = loadMcplServers(DEFAULT_CONFIG_PATH);
 
@@ -77,7 +99,7 @@ async function createFramework(membrane: Membrane) {
   const filesModule = new FilesModule({ namespace: 'products' });
 
   const framework = await AgentFramework.create({
-    storePath: config.storePath,
+    storePath,
     membrane,
     agents: [
       {
@@ -103,16 +125,58 @@ async function createFramework(membrane: Membrane) {
 }
 
 // ---------------------------------------------------------------------------
+// Synesthete auto-naming hook
+// ---------------------------------------------------------------------------
+
+function setupSynesthete(app: AppContext): void {
+  app.framework.onTrace((event) => {
+    if (event.type !== 'message:added') return;
+    const e = event as unknown as { source: string };
+    if (e.source !== 'external-message') return;
+
+    app.userMessageCount++;
+    if (app.userMessageCount !== 3) return;
+
+    const session = app.sessionManager.getActiveSession();
+    if (!session || session.manuallyNamed) return;
+
+    // Fire-and-forget: generate name in background
+    const agent = app.framework.getAgent('researcher');
+    const cm = agent?.getContextManager();
+    if (!cm) return;
+
+    const { messages } = cm.queryMessages({});
+    const summary = messages
+      .filter(m => m.content.some((b: { type: string }) => b.type === 'text'))
+      .slice(0, 6)
+      .map(m => {
+        const text = m.content
+          .filter((b: { type: string }): b is { type: 'text'; text: string } => b.type === 'text')
+          .map((b: { text: string }) => b.text)
+          .join(' ');
+        return `${m.participant}: ${text.slice(0, 200)}`;
+      })
+      .join('\n');
+
+    generateSessionName(app.membrane, summary).then(name => {
+      if (name) {
+        app.sessionManager.renameSession(session.id, name, false);
+      }
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Piped/headless mode (--no-tui or non-TTY stdin)
 // ---------------------------------------------------------------------------
 
-async function runPiped(framework: AgentFramework) {
+async function runPiped(app: AppContext) {
   const { createInterface } = await import('node:readline');
   const { handleCommand } = await import('./commands.js');
 
   let inferenceResolve: (() => void) | null = null;
 
-  framework.onTrace((event) => {
+  app.framework.onTrace((event) => {
     const e = event as unknown as Record<string, unknown>;
     switch (event.type) {
       case 'inference:started':
@@ -160,11 +224,15 @@ async function runPiped(framework: AgentFramework) {
     const trimmed = line.trim();
     if (!trimmed) return false;
     if (trimmed.startsWith('/')) {
-      const result = handleCommand(trimmed, framework);
+      const result = handleCommand(trimmed, app);
       if (result.quit) return true;
       for (const l of result.lines) console.log(l.text);
+      if (result.switchToSessionId) {
+        await app.switchSession(result.switchToSessionId);
+        console.log('Session switched.');
+      }
     } else {
-      framework.pushEvent({
+      app.framework.pushEvent({
         type: 'external-message', source: 'cli',
         content: trimmed, metadata: {}, triggerInference: true,
       });
@@ -184,7 +252,7 @@ async function runPiped(framework: AgentFramework) {
       if (await processLine(line)) break;
     }
     console.log('Done.');
-    await framework.stop();
+    await app.framework.stop();
     return;
   }
 
@@ -198,7 +266,7 @@ async function runPiped(framework: AgentFramework) {
   });
   await new Promise<void>(r => rl.on('close', r));
   console.log('\nShutting down...');
-  await framework.stop();
+  await app.framework.stop();
 }
 
 // ---------------------------------------------------------------------------
@@ -208,15 +276,45 @@ async function runPiped(framework: AgentFramework) {
 async function main() {
   const adapter = new AnthropicAdapter({ apiKey: config.apiKey! });
   const membrane = new Membrane(adapter, { formatter: new NativeFormatter() });
-  const framework = await createFramework(membrane);
+
+  // Session management
+  const sessionManager = new SessionManager(config.dataDir);
+  sessionManager.migrateIfNeeded();
+
+  let activeSession = sessionManager.getActiveSession();
+  if (!activeSession) {
+    activeSession = sessionManager.createSession();
+  }
+
+  const storePath = sessionManager.getStorePath(activeSession.id);
+  const framework = await createFramework(membrane, storePath);
+
+  // Build app context
+  const app: AppContext = {
+    framework,
+    membrane,
+    sessionManager,
+    userMessageCount: 0,
+
+    async switchSession(id: string) {
+      await this.framework.stop();
+      sessionManager.setActiveSession(id);
+      const newStorePath = sessionManager.getStorePath(id);
+      this.framework = await createFramework(membrane, newStorePath);
+      this.framework.start();
+      this.userMessageCount = 0;
+      setupSynesthete(this);
+    },
+  };
 
   framework.start();
+  setupSynesthete(app);
 
   if (noTui) {
-    await runPiped(framework);
+    await runPiped(app);
   } else {
     const { runTui } = await import('./tui.js');
-    await runTui(framework, membrane);
+    await runTui(app);
   }
 }
 

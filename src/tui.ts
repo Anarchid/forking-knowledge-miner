@@ -34,6 +34,14 @@ import type { Membrane, NormalizedRequest } from 'membrane';
 import type { SubagentModule, ActiveSubagent } from './modules/subagent-module.js';
 import { handleCommand } from './commands.js';
 
+interface AppContext {
+  framework: AgentFramework;
+  membrane: Membrane;
+  sessionManager: import('./session-manager.js').SessionManager;
+  userMessageCount: number;
+  switchSession(id: string): Promise<void>;
+}
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -94,11 +102,13 @@ const WHITE = '#cccccc';
 // Main
 // ---------------------------------------------------------------------------
 
-export async function runTui(framework: AgentFramework, membrane: Membrane): Promise<void> {
+export async function runTui(app: AppContext): Promise<void> {
+  const membrane = app.membrane;
+
   // Redirect stderr to a log file — console.error is invisible once the TUI owns the terminal
-  const logDir = process.env.STORE_PATH || './data/store';
+  const logDir = process.env.DATA_DIR || './data';
   mkdirSync(logDir, { recursive: true });
-  const logPath = `${logDir}/../tui-error.log`;
+  const logPath = `${logDir}/tui-error.log`;
   const logStream = createWriteStream(logPath, { flags: 'a' });
   logStream.write(`\n--- session ${new Date().toISOString()} ---\n`);
   const origStderrWrite = process.stderr.write.bind(process.stderr);
@@ -159,7 +169,7 @@ export async function runTui(framework: AgentFramework, membrane: Membrane): Pro
 
   const statusRight = new TextRenderable(renderer, {
     id: 'status-right',
-    content: formatTokens(state.tokens),
+    content: formatTokens(state.tokens, false),
     fg: DIM_GRAY,
   });
 
@@ -267,7 +277,7 @@ export async function runTui(framework: AgentFramework, membrane: Membrane): Pro
 
   function updateStatus() {
     statusLeft.content = formatStatusLeft(state);
-    statusRight.content = formatTokens(state.tokens);
+    statusRight.content = formatTokens(state.tokens, verboseChat);
   }
 
   function beginStream() {
@@ -403,7 +413,7 @@ export async function runTui(framework: AgentFramework, membrane: Membrane): Pro
     let compStr = '';
     if (node.isResearcher) {
       try {
-        const agent = framework.getAgent('researcher');
+        const agent = app.framework.getAgent('researcher');
         const cm = agent?.getContextManager();
         const strategy = (cm as any)?.strategy as AutobiographicalStrategy | undefined;
         if (strategy?.getStats) {
@@ -783,7 +793,7 @@ export async function runTui(framework: AgentFramework, membrane: Membrane): Pro
 
   // ── Subagent polling ────────────────────────────────────────────────
 
-  const subMod = framework.getAllModules().find(m => m.name === 'subagent') as SubagentModule | undefined;
+  let subMod = app.framework.getAllModules().find(m => m.name === 'subagent') as SubagentModule | undefined;
 
   // Subscribe to each subagent's stream for peek logs + done events.
   const subagentStreamUnsubs: Array<() => void> = [];
@@ -978,7 +988,7 @@ export async function runTui(framework: AgentFramework, membrane: Membrane): Pro
     if (!text) return;
 
     if (text.startsWith('/')) {
-      const result = handleCommand(text, framework);
+      const result = handleCommand(text, app);
       if (result.quit) {
         cleanup();
         return;
@@ -993,11 +1003,42 @@ export async function runTui(framework: AgentFramework, membrane: Membrane): Pro
           addLine(l.text, GRAY);
         }
       }
+
+      // Session switch: async teardown + rebuild
+      if (result.switchToSessionId) {
+        state.status = 'switching';
+        updateStatus();
+        app.framework.offTrace(onTrace as (e: unknown) => void);
+
+        app.switchSession(result.switchToSessionId).then(() => {
+          // Rebind to new framework
+          subMod = app.framework.getAllModules().find(m => m.name === 'subagent') as SubagentModule | undefined;
+          app.framework.onTrace(onTrace as (e: unknown) => void);
+
+          // Clear conversation display
+          const children = [...scrollBox.getChildren()];
+          for (const child of children) {
+            scrollBox.remove(child.id);
+          }
+
+          const session = app.sessionManager.getActiveSession();
+          addLine(`Session: ${session?.name ?? 'unknown'}`, GRAY);
+          state.status = 'idle';
+          state.tool = null;
+          state.subagents = [];
+          state.tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+          updateStatus();
+        }).catch(err => {
+          addLine(`Session switch failed: ${err}`, RED);
+          state.status = 'error';
+          updateStatus();
+        });
+      }
     } else {
       addLine(`You: ${text}`, GREEN);
       state.status = 'thinking';
       updateStatus();
-      framework.pushEvent({
+      app.framework.pushEvent({
         type: 'external-message', source: 'tui',
         content: text, metadata: {}, triggerInference: true,
       });
@@ -1006,9 +1047,11 @@ export async function runTui(framework: AgentFramework, membrane: Membrane): Pro
 
   // ── Init ───────────────────────────────────────────────────────────
 
+  const session = app.sessionManager.getActiveSession();
   addLine('Forking Knowledge Miner. Type /help for commands.', GRAY);
+  if (session) addLine(`Session: ${session.name}`, DIM_GRAY);
   addLine(`Error log: ${logPath}`, DIM_GRAY);
-  framework.onTrace(onTrace as (e: unknown) => void);
+  app.framework.onTrace(onTrace as (e: unknown) => void);
 
   // ── Cleanup ────────────────────────────────────────────────────────
 
@@ -1016,13 +1059,13 @@ export async function runTui(framework: AgentFramework, membrane: Membrane): Pro
     cleanupPeek();
     for (const unsub of subagentStreamUnsubs) unsub();
     clearInterval(pollTimer);
-    framework.offTrace(onTrace as (e: unknown) => void);
+    app.framework.offTrace(onTrace as (e: unknown) => void);
     renderer.destroy();
     process.stdout.write('\x1b]0;\x07');
     // Restore stderr
     process.stderr.write = origStderrWrite;
     logStream.end();
-    framework.stop().then(() => {
+    app.framework.stop().then(() => {
       resolveExit?.();
     });
   }
@@ -1055,17 +1098,21 @@ function formatStatusLeft(state: TuiState): string {
   return bar;
 }
 
-function formatTokens(tokens: TokenUsage): string {
+function formatTokens(tokens: TokenUsage, verbose: boolean): string {
+  const parts: string[] = [];
+
   const total = tokens.input + tokens.output;
-  if (total === 0) return '';
+  if (total > 0) {
+    const fmt = (n: number) => {
+      if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
+      if (n >= 1_000) return (n / 1_000).toFixed(1) + 'k';
+      return String(n);
+    };
+    let s = `${fmt(tokens.input)}in ${fmt(tokens.output)}out`;
+    if (tokens.cacheRead > 0) s += ` ${fmt(tokens.cacheRead)}cache`;
+    parts.push(s);
+  }
 
-  const fmt = (n: number) => {
-    if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
-    if (n >= 1_000) return (n / 1_000).toFixed(1) + 'k';
-    return String(n);
-  };
-
-  let s = `${fmt(tokens.input)}in ${fmt(tokens.output)}out`;
-  if (tokens.cacheRead > 0) s += ` ${fmt(tokens.cacheRead)}cache`;
-  return s;
+  parts.push(verbose ? 'C-v:terse' : 'C-v:verbose');
+  return parts.join('  ');
 }
