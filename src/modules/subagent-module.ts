@@ -201,12 +201,13 @@ export class SubagentModule implements Module {
   private streamSubscribers = new Map<string, Set<SubagentStreamCallback>>();  // displayName → callbacks
   private lastInputTokens = new Map<string, number>();  // displayName → last known input token count
   private cancellationHandles = new Map<string, { reject: (err: Error) => void }>();  // displayName → cancel
+  private agentDepths = new Map<string, number>();  // framework agent name → fork depth
 
   constructor(config: SubagentModuleConfig = {}) {
     this.config = config;
     this.maxDepth = config.maxDepth ?? 3;
     this.currentDepth = config.currentDepth ?? 0;
-    this.configuredMaxConcurrent = config.maxConcurrent ?? 3;
+    this.configuredMaxConcurrent = config.maxConcurrent ?? 5;
     this.effectiveConcurrent = this.configuredMaxConcurrent;
     this.maxPromptTokens = config.maxPromptTokens ?? 190_000;
     this.maxExecutionMs = config.maxExecutionMs ?? 600_000;
@@ -419,13 +420,14 @@ export class SubagentModule implements Module {
   }
 
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
+    const caller = call.callerAgentName;
     switch (call.name) {
       case 'spawn':
-        return this.handleSpawn(call.input as SpawnInput);
+        return this.handleSpawn(call.input as SpawnInput, caller);
       case 'fork':
-        return this.handleFork(call.input as ForkInput);
+        return this.handleFork(call.input as ForkInput, caller);
       case 'launch':
-        return this.handleLaunch(call.input as LaunchInput);
+        return this.handleLaunch(call.input as LaunchInput, caller);
       case 'wait':
         return this.handleWait(call.input as WaitInput);
       case 'concurrency':
@@ -854,17 +856,18 @@ export class SubagentModule implements Module {
   // Tool Handlers
   // =========================================================================
 
-  private async handleSpawn(input: SpawnInput): Promise<ToolResult> {
-    if (this.currentDepth >= this.maxDepth) {
+  private async handleSpawn(input: SpawnInput, callerAgentName?: string): Promise<ToolResult> {
+    const callerDepth = callerAgentName ? (this.agentDepths.get(callerAgentName) ?? 0) : 0;
+    if (callerDepth >= this.maxDepth) {
       return {
         success: false,
         isError: true,
-        error: `Max subagent depth ${this.maxDepth} reached`,
+        error: `Max subagent depth ${this.maxDepth} reached (caller at depth ${callerDepth})`,
       };
     }
 
     try {
-      const result = await this.runSpawn(input);
+      const result = await this.runSpawn(input, callerAgentName, callerDepth);
       return { success: true, data: result };
     } catch (err) {
       return {
@@ -875,17 +878,18 @@ export class SubagentModule implements Module {
     }
   }
 
-  private async handleFork(input: ForkInput): Promise<ToolResult> {
-    if (this.currentDepth >= this.maxDepth) {
+  private async handleFork(input: ForkInput, callerAgentName?: string): Promise<ToolResult> {
+    const callerDepth = callerAgentName ? (this.agentDepths.get(callerAgentName) ?? 0) : 0;
+    if (callerDepth >= this.maxDepth) {
       return {
         success: false,
         isError: true,
-        error: `Max subagent depth ${this.maxDepth} reached`,
+        error: `Max subagent depth ${this.maxDepth} reached (caller at depth ${callerDepth})`,
       };
     }
 
     try {
-      const result = await this.runFork(input);
+      const result = await this.runFork(input, callerAgentName, callerDepth);
       return { success: true, data: result };
     } catch (err) {
       return {
@@ -896,12 +900,13 @@ export class SubagentModule implements Module {
     }
   }
 
-  private async handleLaunch(input: LaunchInput): Promise<ToolResult> {
-    if (this.currentDepth >= this.maxDepth) {
+  private async handleLaunch(input: LaunchInput, callerAgentName?: string): Promise<ToolResult> {
+    const callerDepth = callerAgentName ? (this.agentDepths.get(callerAgentName) ?? 0) : 0;
+    if (callerDepth >= this.maxDepth) {
       return {
         success: false,
         isError: true,
-        error: `Max subagent depth ${this.maxDepth} reached`,
+        error: `Max subagent depth ${this.maxDepth} reached (caller at depth ${callerDepth})`,
       };
     }
 
@@ -913,13 +918,13 @@ export class SubagentModule implements Module {
           task: input.task,
           systemPrompt: input.systemPrompt,
           model: input.model,
-        })
+        }, callerAgentName, callerDepth)
       : this.runSpawn({
           name: input.name,
           systemPrompt: input.systemPrompt ?? 'You are a helpful research assistant.',
           task: input.task,
           model: input.model,
-        });
+        }, callerAgentName, callerDepth);
 
     const task: LaunchedTask = {
       taskId,
@@ -991,8 +996,9 @@ export class SubagentModule implements Module {
   // Subagent Execution
   // =========================================================================
 
-  private async runSpawn(input: SpawnInput): Promise<SubagentResult> {
+  private async runSpawn(input: SpawnInput, _callerAgentName?: string, callerDepth = 0): Promise<SubagentResult> {
     const { waitedMs } = await this.acquireSlot();
+    const childDepth = callerDepth + 1;
 
     const entry: ActiveSubagent = {
       name: input.name, type: 'spawn', task: input.task,
@@ -1020,8 +1026,11 @@ export class SubagentModule implements Module {
             autoTickOnNewMessage: true,
             maxMessageTokens: 10_000,
           }),
-          allowedTools: this.filterToolNames(input.tools),
+          allowedTools: this.filterToolNames(input.tools, callerDepth),
         });
+
+        // Track depth for recursive fork/spawn calls from this agent
+        this.agentDepths.set(agentName, childDepth);
 
         // Register live state for peek observability
         this.registerLive(input.name, agentName, input.systemPrompt, contextManager);
@@ -1099,6 +1108,7 @@ export class SubagentModule implements Module {
           entry.statusMessage = `Retry ${attempt + 1}: ${lastError.message}`;
           await new Promise(resolve => setTimeout(resolve, delay));
         } finally {
+          this.agentDepths.delete(agentName);
           this.unregisterLive(input.name, agentName);
           cleanup();
         }
@@ -1113,8 +1123,9 @@ export class SubagentModule implements Module {
     }
   }
 
-  private async runFork(input: ForkInput): Promise<SubagentResult> {
+  private async runFork(input: ForkInput, callerAgentName?: string, callerDepth = 0): Promise<SubagentResult> {
     const { waitedMs } = await this.acquireSlot();
+    const childDepth = callerDepth + 1;
 
     const entry: ActiveSubagent = {
       name: input.name, type: 'fork', task: input.task,
@@ -1125,9 +1136,11 @@ export class SubagentModule implements Module {
     try {
       const framework = this.getFramework();
 
-      const parentAgent = this.config.parentAgentName
-        ? framework.getAgent(this.config.parentAgentName)
-        : null;
+      // Dynamic parent resolution: prefer the caller agent (enables recursive forks),
+      // fall back to the configured parent agent for backward compat.
+      const parentAgent = callerAgentName
+        ? framework.getAgent(callerAgentName)
+        : (this.config.parentAgentName ? framework.getAgent(this.config.parentAgentName) : null);
 
       const systemPrompt = input.systemPrompt
         ?? (parentAgent ? parentAgent.systemPrompt : 'You are a research assistant.');
@@ -1151,8 +1164,11 @@ export class SubagentModule implements Module {
             autoTickOnNewMessage: true,
             maxMessageTokens: 10_000,
           }),
-          allowedTools: this.filterToolNames(),
+          allowedTools: this.filterToolNames(undefined, callerDepth),
         });
+
+        // Track depth for recursive fork/spawn calls from this agent
+        this.agentDepths.set(agentName, childDepth);
 
         // Register live state for peek observability
         this.registerLive(input.name, agentName, systemPrompt, contextManager);
@@ -1262,6 +1278,7 @@ export class SubagentModule implements Module {
           entry.statusMessage = `Retry ${attempt + 1}: ${lastError.message}`;
           await new Promise(resolve => setTimeout(resolve, delay));
         } finally {
+          this.agentDepths.delete(agentName);
           this.unregisterLive(input.name, agentName);
           cleanup();
         }
@@ -1302,8 +1319,9 @@ export class SubagentModule implements Module {
    * Build the allowedTools list for a subagent.
    * Removes subagent tools if at depth limit.
    */
-  private filterToolNames(allowedTools?: string[]): 'all' | string[] {
-    if (this.currentDepth + 1 >= this.maxDepth) {
+  private filterToolNames(allowedTools?: string[], callerDepth = 0): 'all' | string[] {
+    // Use per-agent depth (from caller) rather than the module's static depth
+    if (callerDepth + 1 >= this.maxDepth) {
       const allTools = this.getFramework().getAllTools();
       const filtered = allTools
         .filter(t => !t.name.startsWith('subagent:'))
