@@ -16,7 +16,7 @@
  */
 
 import { Membrane, AnthropicAdapter, NativeFormatter } from 'membrane';
-import { AgentFramework, AutobiographicalStrategy, FilesModule } from '@connectome/agent-framework';
+import { AgentFramework, KnowledgeStrategy, FilesModule } from '@connectome/agent-framework';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { existsSync } from 'node:fs';
@@ -106,12 +106,15 @@ async function createFramework(membrane: Membrane, storePath: string): Promise<A
         name: 'researcher',
         model: config.model,
         systemPrompt: SYSTEM_PROMPT,
-        strategy: new AutobiographicalStrategy({
+        strategy: new KnowledgeStrategy({
           headWindowTokens: 4000,
           recentWindowTokens: 30000,
           compressionModel: config.model,
           autoTickOnNewMessage: true,
           maxMessageTokens: 10000,
+          // Phase detection defaults: mcpl:/zulip: → research,
+          // subagent: → subagent, lessons:create/update → lesson
+          // Asymmetric L1 budget: synthesis floor 40%, research cap 30%
         }),
       },
     ],

@@ -200,7 +200,13 @@ const framework = await AgentFramework.create({
     name: 'researcher',
     model: 'claude-opus-4-20250514',
     systemPrompt: SYSTEM_PROMPT,
-    strategy: new PassthroughStrategy(),
+    strategy: new KnowledgeStrategy({
+      headWindowTokens: 4000,
+      recentWindowTokens: 30000,
+      compressionModel: 'claude-opus-4-6',
+      autoTickOnNewMessage: true,
+      maxMessageTokens: 10000,
+    }),
   }],
   modules: [tuiModule, subagentModule, lessonsModule, retrievalModule],
   mcplServers: [{
@@ -267,7 +273,7 @@ bun --watch src/index.ts
 | Subagent TUI visibility (Tab toggle) | Done |
 | Bun + Chronicle compatibility | Validated (56 tests) |
 | End-to-end knowledge extraction session | Not yet tested |
-| KnowledgeStrategy (context compression) | Not started |
+| KnowledgeStrategy (context compression) | Done |
 | Tests | Not started |
 
 ## TUI Evolution

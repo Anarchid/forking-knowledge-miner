@@ -9,10 +9,10 @@
     "test": "bun test"
   },
   "dependencies": {
-    "@connectome/agent-framework": "github:Anarchid/agent-framework#zombie-detection",
-    "@connectome/context-manager": "github:Anarchid/context-manager#fix-tool-crash",
+    "@connectome/agent-framework": "github:Tengro/agent-framework#feature/knowledge-strategy",
+    "@connectome/context-manager": "github:Tengro/context-manager#feature/knowledge-strategy",
     "chronicle": "file:../chronicle",
-    "membrane": "github:Anarchid/membrane#main",
+    "membrane": "github:Tengro/membrane#main",
     "@opentui/core": "^0.1.82"
   },
   "devDependencies": {
