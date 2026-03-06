@@ -271,10 +271,10 @@ export class WakeModule implements Module {
             name: { type: 'string', description: 'Unique name for this subscription' },
             filter: {
               type: 'object',
-              description: 'Match filter',
+              description: 'Match filter. The pattern is matched against the MESSAGE CONTENT text (not channel names or metadata). Use text for substring match, regex for pattern match.',
               properties: {
                 type: { type: 'string', enum: ['text', 'regex'], description: 'Filter type' },
-                pattern: { type: 'string', description: 'Text to match or regex pattern' },
+                pattern: { type: 'string', description: 'Pattern matched against message content text. For text type: case-insensitive substring match. For regex type: regex tested against content.' },
               },
               required: ['type', 'pattern'],
             },
@@ -282,7 +282,7 @@ export class WakeModule implements Module {
             scope: {
               type: 'array',
               items: { type: 'string' },
-              description: 'Event types to match (empty = all)',
+              description: 'Event types to filter by. Values: "channel:incoming", "push:event", or custom sources. Empty array or omitted = match all event types (recommended default).',
             },
           },
           required: ['name', 'filter'],
