@@ -1248,8 +1248,12 @@ export class SubagentModule implements Module {
       let lastError: Error | null = null;
 
       for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
-        // Unique agent name per attempt (cleanup removes previous from framework map)
-        const agentName = attempt === 0 ? input.name : `${input.name}-retry${attempt}`;
+        // Unique agent name: include depth + timestamp to prevent collisions when
+        // a child fork uses the same display name as its parent (e.g. both called
+        // "fork-level-2"). Without this, the child overwrites the parent in the
+        // framework's agents Map, and the parent's completion promise never resolves.
+        const suffix = attempt === 0 ? `d${childDepth}-${Date.now()}` : `d${childDepth}-retry${attempt}-${Date.now()}`;
+        const agentName = `${input.name}-${suffix}`;
 
         const { agent, contextManager, cleanup } = await framework.createEphemeralAgent({
           name: agentName,
@@ -1302,9 +1306,13 @@ export class SubagentModule implements Module {
           contextManager.addMessage('user', [{
             type: 'tool_result',
             toolUseId: forkCallId,
-            content: `Fork successful — you are now running inside the fork "${input.name}". ` +
+            content: `Fork successful — you are now running inside the fork "${input.name}" ` +
+              `(depth ${childDepth}/${this.maxDepth}). ` +
               `Complete your task, then call subagent:return with your findings to deliver ` +
-              `them back to the parent agent.`,
+              `them back to the parent agent.` +
+              (childDepth < this.maxDepth
+                ? ` You can sub-fork if needed (${this.maxDepth - childDepth} levels remaining).`
+                : ` You are at max depth — you cannot sub-fork.`),
           }] as ContentBlock[]);
 
           // Pre-validate prompt size
