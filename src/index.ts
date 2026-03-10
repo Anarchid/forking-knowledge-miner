@@ -25,6 +25,7 @@ import { SubagentModule } from './modules/subagent-module.js';
 import { LessonsModule } from './modules/lessons-module.js';
 import { RetrievalModule } from './modules/retrieval-module.js';
 import { WakeModule } from './modules/wake-module.js';
+import { LocalFilesModule } from './modules/local-files-module.js';
 import { TuiModule } from './modules/tui-module.js';
 import { loadMcplServers, saveMcplServers, DEFAULT_CONFIG_PATH } from './mcpl-config.js';
 import { SessionManager } from './session-manager.js';
@@ -98,6 +99,7 @@ async function createFramework(membrane: Membrane, storePath: string): Promise<A
   const lessonsModule = new LessonsModule();
   const retrievalModule = new RetrievalModule({ membrane });
   const filesModule = new FilesModule({ namespace: 'products' });
+  const localFilesModule = new LocalFilesModule();
 
   // WakeModule — onWake callback wired after framework creation
   let emitWakeTrace: ((subs: string[], summary: string) => void) | undefined;
@@ -129,7 +131,7 @@ async function createFramework(membrane: Membrane, storePath: string): Promise<A
         }),
       },
     ],
-    modules: [new TuiModule(), subagentModule, lessonsModule, retrievalModule, wakeModule, filesModule],
+    modules: [new TuiModule(), subagentModule, lessonsModule, retrievalModule, wakeModule, filesModule, localFilesModule],
     mcplServers: augmentedServers,
   });
 
