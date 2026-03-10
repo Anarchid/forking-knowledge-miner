@@ -878,7 +878,7 @@ export async function runTui(app: AppContext): Promise<void> {
 
           // Track parent-child for fleet tree
           for (const call of calls) {
-            if (call.name === 'subagent:spawn' || call.name === 'subagent:fork') {
+            if (call.name === 'subagent--spawn' || call.name === 'subagent--fork') {
               const childName = (call.input as Record<string, unknown>)?.name as string | undefined;
               if (childName) {
                 agentParent.set(childName, agent);
@@ -898,7 +898,7 @@ export async function runTui(app: AppContext): Promise<void> {
           const sa = state.subagents.find(s => (agent ?? '').includes(s.name));
           if (sa) {
             sa.toolCallsCount += calls.length;
-            sa.statusMessage = names.split(':').pop();
+            sa.statusMessage = names.split('--').pop();
           }
         }
         updateStatus();
@@ -948,7 +948,7 @@ export async function runTui(app: AppContext): Promise<void> {
             // OSC 8 hyperlink for the target directory
             const link = `\x1b]8;;file://${dir}\x07${dir}\x1b]8;;\x07`;
             addLine(`  ${short}materialize → ${link} (${fileList})`, DIM_GRAY);
-          } else if (tool === 'lessons:create' && toolInput.content) {
+          } else if (tool === 'lessons--create' && toolInput.content) {
             const content = String(toolInput.content);
             const tags = (toolInput.tags as string[] | undefined)?.join(', ') ?? '';
             const preview = content.length > 80 ? content.slice(0, 77) + '...' : content;

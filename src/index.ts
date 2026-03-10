@@ -16,7 +16,7 @@
  */
 
 import { Membrane, AnthropicAdapter, NativeFormatter } from 'membrane';
-import { AgentFramework, AutobiographicalStrategy, FilesModule } from '@connectome/agent-framework';
+import { AgentFramework, KnowledgeStrategy, FilesModule } from '@connectome/agent-framework';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { existsSync } from 'node:fs';
@@ -74,7 +74,7 @@ function seedMcplConfig(): void {
 
   const cmd = process.env.ZULIP_MCP_CMD || 'node';
   const args = process.env.ZULIP_MCP_ARGS?.split(' ')
-    || [resolve(__dirname, '../../zulip-mcp/build/index.js')];
+    || [resolve(__dirname, '../../zulip_mcp/build/index.js')];
   const zuliprc = process.env.ZULIP_RC_PATH || resolve(process.cwd(), '.zuliprc');
 
   const env: Record<string, string> = {
@@ -95,6 +95,7 @@ async function createFramework(membrane: Membrane, storePath: string): Promise<A
   const subagentModule = new SubagentModule({
     parentAgentName: 'researcher',
     defaultModel: config.model,
+    defaultMaxTokens: 4096,
   });
   const lessonsModule = new LessonsModule();
   const retrievalModule = new RetrievalModule({ membrane });
@@ -122,7 +123,8 @@ async function createFramework(membrane: Membrane, storePath: string): Promise<A
         name: 'researcher',
         model: config.model,
         systemPrompt: SYSTEM_PROMPT,
-        strategy: new AutobiographicalStrategy({
+        maxTokens: 16384,
+        strategy: new KnowledgeStrategy({
           headWindowTokens: 4000,
           recentWindowTokens: 30000,
           compressionModel: config.model,

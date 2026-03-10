@@ -2,9 +2,9 @@
  * SubagentModule — spawn and fork ephemeral subagents.
  *
  * Tools:
- *   subagent:spawn  — Fresh agent with system prompt + task, no inherited context
- *   subagent:fork   — Agent inheriting parent's compiled context
- *   subagent:hud    — Toggle fleet status HUD overlay
+ *   subagent--spawn  — Fresh agent with system prompt + task, no inherited context
+ *   subagent--fork   — Agent inheriting parent's compiled context
+ *   subagent--hud    — Toggle fleet status HUD overlay
  *
  * By default, spawn/fork are async: they return immediately and deliver
  * results as user messages + inference-request events. Pass `sync: true`
@@ -28,7 +28,7 @@ import type {
   ContextManager,
 } from '@connectome/agent-framework';
 import type { AgentFramework } from '@connectome/agent-framework';
-import { AutobiographicalStrategy } from '@connectome/agent-framework';
+import { KnowledgeStrategy } from '@connectome/agent-framework';
 import type { ContentBlock } from 'membrane';
 
 // ---------------------------------------------------------------------------
@@ -230,7 +230,7 @@ export class SubagentModule implements Module {
   /** Parent agent name for each subagent (for fleet tree reconstruction). */
   readonly parentMap = new Map<string, string>();
 
-  // Stashed results from subagent:return tool calls, keyed by framework agent name
+  // Stashed results from subagent--return tool calls, keyed by framework agent name
   private returnedResults = new Map<string, string>();
 
   // Live state for peek observability
@@ -435,7 +435,7 @@ export class SubagentModule implements Module {
             tools: {
               type: 'array',
               items: { type: 'string' },
-              description: 'Tool names the subagent can use (default: all non-subagent tools)',
+              description: 'Tool names the subagent can use (default: all). Note: subagent--return is always included automatically.',
             },
             sync: { type: 'boolean', description: 'If true, block until subagent completes (default: false)' },
             timeoutMs: { type: 'number', description: 'Execution timeout in milliseconds. For async tasks, the subagent is cancelled after this duration. For sync tasks, auto-detaches to background after this duration (result delivered as message). Example: 600000 = 10 minutes.' },
@@ -1309,7 +1309,8 @@ export class SubagentModule implements Module {
           model,
           systemPrompt: input.systemPrompt,
           maxTokens: input.maxTokens ?? this.config.defaultMaxTokens ?? 4096,
-          strategy: new AutobiographicalStrategy({
+          maxStreamTokens: 200_000,
+          strategy: new KnowledgeStrategy({
             headWindowTokens: 2_000,
             recentWindowTokens: 80_000,
             compressionModel: model,
@@ -1454,7 +1455,8 @@ export class SubagentModule implements Module {
           model,
           systemPrompt,
           maxTokens: this.config.defaultMaxTokens ?? 4096,
-          strategy: new AutobiographicalStrategy({
+          maxStreamTokens: 200_000,
+          strategy: new KnowledgeStrategy({
             headWindowTokens: 2_000,
             recentWindowTokens: 80_000,
             compressionModel: model,
@@ -1494,7 +1496,7 @@ export class SubagentModule implements Module {
           contextManager.addMessage(agentName, [{
             type: 'tool_use',
             id: forkCallId,
-            name: 'subagent:fork',
+            name: 'subagent--fork',
             input: { name: input.name, task: input.task },
           }] as ContentBlock[]);
           contextManager.addMessage('user', [{
@@ -1502,7 +1504,7 @@ export class SubagentModule implements Module {
             toolUseId: forkCallId,
             content: `Fork successful — you are now running inside the fork "${input.name}" ` +
               `(depth ${childDepth}/${this.maxDepth}). ` +
-              `Complete your task, then call subagent:return with your findings to deliver ` +
+              `Complete your task, then call subagent--return with your findings to deliver ` +
               `them back to the parent agent.` +
               (childDepth < this.maxDepth
                 ? ` You can sub-fork if needed (${this.maxDepth - childDepth} levels remaining).`
@@ -1620,21 +1622,28 @@ export class SubagentModule implements Module {
   /**
    * Build the allowedTools list for a subagent.
    * Removes subagent tools if at depth limit.
+   *
    */
   private filterToolNames(allowedTools?: string[], callerDepth = 0): 'all' | string[] {
+    // Always include subagent--return — subagents need it to deliver results
+    const ensureReturn = (list: string[]) => {
+      if (!list.includes('subagent--return')) list.push('subagent--return');
+      return list;
+    };
+
     // Use per-agent depth (from caller) rather than the module's static depth
     if (callerDepth + 1 >= this.maxDepth) {
       const allTools = this.getFramework().getAllTools();
       const filtered = allTools
-        .filter(t => !t.name.startsWith('subagent:'))
+        .filter(t => !t.name.startsWith('subagent--'))
         .map(t => t.name);
       if (allowedTools) {
         const allowed = new Set(allowedTools);
-        return filtered.filter(n => allowed.has(n));
+        return ensureReturn(filtered.filter(n => allowed.has(n)));
       }
-      return filtered;
+      return ensureReturn(filtered);
     }
-    return allowedTools ?? 'all';
+    return allowedTools ? ensureReturn(allowedTools) : 'all';
   }
 
 }
