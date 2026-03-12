@@ -7,16 +7,26 @@
 
 import type { Membrane } from 'membrane';
 
-const NAMING_PROMPT = `You are a session naming assistant. Given a brief summary of a conversation, generate a short, evocative name (2-4 words) that captures its essence. The name should be memorable and descriptive, like a chapter title.
+const DEFAULT_EXAMPLES = [
+  'Context Window Budgeting',
+  'Agent Memory Architecture',
+  'Pipeline Debug Session',
+  'Schema Migration Plan',
+  'API Integration Review',
+];
+
+function buildNamingPrompt(examples?: string[]): string {
+  const exampleList = (examples ?? DEFAULT_EXAMPLES)
+    .map(e => `- "${e}"`)
+    .join('\n');
+
+  return `You are a session naming assistant. Given a brief summary of a conversation, generate a short, evocative name (2-4 words) that captures its essence. The name should be memorable and descriptive, like a chapter title.
 
 Examples of good names:
-- "Zulip Thread Archaeology"
-- "Lobby Protocol Dissection"
-- "Context Window Budgeting"
-- "Agent Memory Architecture"
-- "Discord Bridge Debugging"
+${exampleList}
 
 Respond with ONLY the name, nothing else. No quotes, no explanation.`;
+}
 
 /**
  * Generate a session name from conversation content.
@@ -25,6 +35,7 @@ Respond with ONLY the name, nothing else. No quotes, no explanation.`;
 export async function generateSessionName(
   membrane: Membrane,
   conversationSummary: string,
+  examples?: string[],
 ): Promise<string | null> {
   try {
     const response = await membrane.complete({
@@ -34,7 +45,7 @@ export async function generateSessionName(
           content: [{ type: 'text', text: conversationSummary }],
         },
       ],
-      system: NAMING_PROMPT,
+      system: buildNamingPrompt(examples),
       config: {
         model: 'claude-haiku-4-5-20251001',
         maxTokens: 30,

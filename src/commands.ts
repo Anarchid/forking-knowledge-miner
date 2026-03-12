@@ -15,34 +15,56 @@
  *   /mcp list|add|remove|env — Manage MCPL server config
  *   /budget [N]    — Show/set stream token budget (e.g. /budget 1m)
  *   /session       — Session management (list, new, switch, rename, delete)
+ *   /recipe        — Show current recipe info
  *   /help          — List commands
  */
 
 import type { AgentFramework } from '@connectome/agent-framework';
 import type { ContextManager } from '@connectome/context-manager';
+import type { Recipe } from './recipe.js';
 import { readMcplServersFile, saveMcplServers, DEFAULT_CONFIG_PATH } from './mcpl-config.js';
 
 /** Imported lazily to avoid circular deps — index.ts re-exports the type. */
 interface AppContext {
   framework: AgentFramework;
   sessionManager: import('./session-manager.js').SessionManager;
+  recipe: Recipe;
+  branchState: BranchState;
   switchSession(id: string): Promise<void>;
 }
 
 export type Line = { text: string; style?: 'user' | 'agent' | 'tool' | 'system' };
 
 // Undo/redo stacks: track (branchId, messageId) pairs for time-travel
-interface StatePoint {
+export interface StatePoint {
   branchId: string;
   branchName: string;
   messageId?: string;
 }
 
-const undoStack: StatePoint[] = [];
-const redoStack: StatePoint[] = [];
+/**
+ * Mutable branch-related state. Lives on AppContext so it can be
+ * reset consistently on session switch, MCPL branch operations, etc.
+ */
+export interface BranchState {
+  undoStack: StatePoint[];
+  redoStack: StatePoint[];
+  checkpoints: Map<string, StatePoint>;
+}
 
-// Named checkpoints: name → StatePoint
-const checkpoints = new Map<string, StatePoint>();
+export function createBranchState(): BranchState {
+  return {
+    undoStack: [],
+    redoStack: [],
+    checkpoints: new Map(),
+  };
+}
+
+export function resetBranchState(bs: BranchState): void {
+  bs.undoStack.length = 0;
+  bs.redoStack.length = 0;
+  bs.checkpoints.clear();
+}
 
 export interface CommandResult {
   lines: Line[];
@@ -55,10 +77,16 @@ export interface CommandResult {
 
 /**
  * Get the context manager for the main agent.
+ * Falls back to the first registered agent if the named one isn't found.
  */
-function getAgentCM(framework: AgentFramework, agentName = 'researcher'): ContextManager | null {
-  const agent = framework.getAgent(agentName);
-  return agent?.getContextManager() ?? null;
+function getAgentCM(framework: AgentFramework, agentName?: string): ContextManager | null {
+  if (agentName) {
+    const agent = framework.getAgent(agentName);
+    if (agent) return agent.getContextManager() ?? null;
+  }
+  // Fallback: first agent
+  const all = framework.getAllAgents();
+  return all[0]?.getContextManager() ?? null;
 }
 
 export function handleCommand(command: string, app: AppContext): CommandResult {
@@ -98,6 +126,7 @@ export function handleCommand(command: string, app: AppContext): CommandResult {
           { text: '  /session switch <name> Switch to session', style: 'system' },
           { text: '  /session rename <name> Rename current session', style: 'system' },
           { text: '  /session delete <name> Delete a session', style: 'system' },
+          { text: '  /recipe                Show current recipe info', style: 'system' },
         ],
       };
 
@@ -111,16 +140,16 @@ export function handleCommand(command: string, app: AppContext): CommandResult {
       return handleLessons(framework);
 
     case 'undo':
-      return handleUndo(framework);
+      return handleUndo(app);
 
     case 'redo':
-      return handleRedo(framework);
+      return handleRedo(app);
 
     case 'checkpoint':
-      return handleCheckpoint(framework, args[0]);
+      return handleCheckpoint(app, args[0]);
 
     case 'restore':
-      return handleRestore(framework, args[0]);
+      return handleRestore(app, args[0]);
 
     case 'branches':
       return handleBranches(framework);
@@ -139,6 +168,9 @@ export function handleCommand(command: string, app: AppContext): CommandResult {
 
     case 'session':
       return handleSession(app, args);
+
+    case 'recipe':
+      return handleRecipe(app);
 
     default:
       return {
@@ -220,11 +252,7 @@ function handleSessionList(app: AppContext): CommandResult {
 
 function handleSessionNew(app: AppContext, name?: string): CommandResult {
   const session = app.sessionManager.createSession(name);
-
-  // Clear per-session undo/redo/checkpoint state
-  undoStack.length = 0;
-  redoStack.length = 0;
-  checkpoints.clear();
+  resetBranchState(app.branchState);
 
   return {
     lines: [{ text: `Switching to new session: ${session.name} [${session.id}]...`, style: 'system' }],
@@ -247,9 +275,7 @@ function handleSessionSwitch(app: AppContext, nameOrId?: string): CommandResult 
     return { lines: [{ text: `Already on session "${session.name}".`, style: 'system' }] };
   }
 
-  undoStack.length = 0;
-  redoStack.length = 0;
-  checkpoints.clear();
+  resetBranchState(app.branchState);
 
   return {
     lines: [{ text: `Switching to session: ${session.name} [${session.id}]...`, style: 'system' }],
@@ -287,6 +313,36 @@ function handleSessionDelete(app: AppContext, nameOrId?: string): CommandResult 
   } catch (err) {
     return { lines: [{ text: `Delete failed: ${err instanceof Error ? err.message : err}`, style: 'system' }] };
   }
+}
+
+// ---------------------------------------------------------------------------
+// /recipe
+// ---------------------------------------------------------------------------
+
+function handleRecipe(app: AppContext): CommandResult {
+  const r = app.recipe;
+  const lines: Line[] = [
+    { text: '--- Recipe ---', style: 'system' },
+    { text: `  Name: ${r.name}`, style: 'system' },
+  ];
+  if (r.description) {
+    lines.push({ text: `  Description: ${r.description}`, style: 'system' });
+  }
+  if (r.version) {
+    lines.push({ text: `  Version: ${r.version}`, style: 'system' });
+  }
+  lines.push({ text: `  Agent: ${r.agent.name || 'agent'} (${r.agent.model || 'default'})`, style: 'system' });
+
+  const mods = r.modules ?? {};
+  const enabled = Object.entries(mods)
+    .filter(([, v]) => v !== false)
+    .map(([k]) => k);
+  lines.push({ text: `  Modules: ${enabled.join(', ') || 'none'}`, style: 'system' });
+
+  const mcpCount = r.mcpServers ? Object.keys(r.mcpServers).length : 0;
+  lines.push({ text: `  MCP servers (recipe): ${mcpCount}`, style: 'system' });
+
+  return { lines };
 }
 
 // ---------------------------------------------------------------------------
@@ -389,7 +445,8 @@ function handleLessons(framework: AgentFramework): CommandResult {
   return { lines };
 }
 
-function handleUndo(framework: AgentFramework): CommandResult {
+function handleUndo(app: AppContext): CommandResult {
+  const { framework, branchState: bs } = app;
   const cm = getAgentCM(framework);
   if (!cm) return { lines: [{ text: 'No agent context manager.', style: 'system' }] };
 
@@ -415,7 +472,7 @@ function handleUndo(framework: AgentFramework): CommandResult {
   try {
     // Save current state for redo
     const currentBranch = cm.currentBranch();
-    redoStack.push({
+    bs.redoStack.push({
       branchId: currentBranch.id,
       branchName: currentBranch.name,
     });
@@ -424,7 +481,7 @@ function handleUndo(framework: AgentFramework): CommandResult {
     const newBranchId = cm.branchAt(undoPoint, `undo-${Date.now()}`);
     cm.switchBranch(newBranchId);
 
-    undoStack.push({
+    bs.undoStack.push({
       branchId: newBranchId,
       branchName: `undo-${Date.now()}`,
       messageId: undoPoint,
@@ -436,15 +493,16 @@ function handleUndo(framework: AgentFramework): CommandResult {
   }
 }
 
-function handleRedo(framework: AgentFramework): CommandResult {
+function handleRedo(app: AppContext): CommandResult {
+  const { framework, branchState: bs } = app;
   const cm = getAgentCM(framework);
   if (!cm) return { lines: [{ text: 'No agent context manager.', style: 'system' }] };
 
-  if (redoStack.length === 0) {
+  if (bs.redoStack.length === 0) {
     return { lines: [{ text: 'Nothing to redo.', style: 'system' }] };
   }
 
-  const point = redoStack.pop()!;
+  const point = bs.redoStack.pop()!;
   try {
     cm.switchBranch(point.branchId);
     return { lines: [{ text: `Redone. Switched to branch ${point.branchName}.`, style: 'system' }], branchChanged: true };
@@ -453,16 +511,16 @@ function handleRedo(framework: AgentFramework): CommandResult {
   }
 }
 
-function handleCheckpoint(framework: AgentFramework, name?: string): CommandResult {
+function handleCheckpoint(app: AppContext, name?: string): CommandResult {
   if (!name) {
     return { lines: [{ text: 'Usage: /checkpoint <name>', style: 'system' }] };
   }
 
-  const cm = getAgentCM(framework);
+  const cm = getAgentCM(app.framework);
   if (!cm) return { lines: [{ text: 'No agent context manager.', style: 'system' }] };
 
   const branch = cm.currentBranch();
-  checkpoints.set(name, {
+  app.branchState.checkpoints.set(name, {
     branchId: branch.id,
     branchName: branch.name,
   });
@@ -470,9 +528,9 @@ function handleCheckpoint(framework: AgentFramework, name?: string): CommandResu
   return { lines: [{ text: `Checkpoint "${name}" saved at branch ${branch.name} (head: ${branch.head}).`, style: 'system' }] };
 }
 
-function handleRestore(framework: AgentFramework, name?: string): CommandResult {
+function handleRestore(app: AppContext, name?: string): CommandResult {
   if (!name) {
-    const names = [...checkpoints.keys()];
+    const names = [...app.branchState.checkpoints.keys()];
     if (names.length === 0) {
       return { lines: [{ text: 'No checkpoints saved. Use /checkpoint <name> to create one.', style: 'system' }] };
     }
@@ -484,12 +542,12 @@ function handleRestore(framework: AgentFramework, name?: string): CommandResult 
     };
   }
 
-  const point = checkpoints.get(name);
+  const point = app.branchState.checkpoints.get(name);
   if (!point) {
     return { lines: [{ text: `Checkpoint "${name}" not found.`, style: 'system' }] };
   }
 
-  const cm = getAgentCM(framework);
+  const cm = getAgentCM(app.framework);
   if (!cm) return { lines: [{ text: 'No agent context manager.', style: 'system' }] };
 
   try {

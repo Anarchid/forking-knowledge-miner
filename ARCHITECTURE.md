@@ -270,6 +270,40 @@ bun --watch src/index.ts
 | KnowledgeStrategy (context compression) | Not started |
 | Tests | Not started |
 
+## Roadmap
+
+### 1. TUI rework for branch operations
+The TUI is imperative (OpenTUI) and builds display state incrementally from trace events. After a Chronicle branch switch (undo/redo/checkpoint restore), the display stays stale — it doesn't re-query the store. Needs:
+- A `refreshFromStore()` path that clears the conversation view and reloads from `queryMessages()` without tearing down the framework
+- Called after any branch operation (`/undo`, `/redo`, `/restore`, `/branch switch`)
+- Preserve branch-independent state (view mode, expanded nodes, layout) while rebuilding message display
+
+### 2. Hierarchical compression in AutobiographicalStrategy
+The context-manager's `AutobiographicalStrategy` currently does single-level compression (raw → diary). Upgrade to moltbot-style 3-level pyramid:
+- **Merge logic in `tick()`**: when N unmerged summaries accumulate at level K, merge into one at level K+1
+- **Anti-redundancy in `select()`**: exclude a summary if all its children are expanded at the level below
+- **Budget carryover**: unused token budget at higher levels flows down (L3 → L2 → L1)
+- **Self-voice framing**: summaries injected as assistant messages (the model's own recollections), not Q&A pairs
+- **Source range tracking**: each compressed chunk records which message sequences it covers (Chronicle is lossless, but we need the mapping)
+
+### 3. KnowledgeStrategy for FKM
+Domain-aware compression strategy that understands knowledge extraction semantics. Prioritizes lesson-relevant messages, research leads, and synthesis differently from generic conversation. Builds on top of the hierarchical compression work.
+
+### 4. Undo/redo at the framework level
+Currently each app builds its own undo/redo on top of Chronicle branching. Should be a first-class framework feature:
+- Auto-record the Chronicle sequence number before each inference turn
+- Expose `undoLastTurn(agentName)` / `redo()` on `AgentFramework`
+- Branch at the recorded sequence, switch to the new branch
+- Emit trace events so TUI/UI layers know to refresh
+
+### 5. MCPL integration in FKM
+FKM currently has config-only MCPL support — servers launch via `mcpl-servers.json` and the framework starts them, but nothing handles incoming activity:
+- No `shouldTriggerInference` callbacks for routing push events to inference
+- No processing of push events or channel messages in the TUI or modules
+- No visibility into MCPL server status or activity in the TUI
+- MCPL-triggered inference is indistinguishable from user-triggered
+- Need interaction model: how does MCPL-pushed content appear in the conversation view?
+
 ## TUI Evolution
 
 1. **Ink/React** — first attempt, clunky rendering, interleaved output

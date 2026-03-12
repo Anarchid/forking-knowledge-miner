@@ -32,12 +32,14 @@ import type { AgentFramework } from '@connectome/agent-framework';
 import type { AutobiographicalStrategy } from '@connectome/context-manager';
 import type { Membrane, NormalizedRequest } from 'membrane';
 import type { SubagentModule, ActiveSubagent } from './modules/subagent-module.js';
-import { handleCommand } from './commands.js';
+import { handleCommand, resetBranchState } from './commands.js';
 
 interface AppContext {
   framework: AgentFramework;
   membrane: Membrane;
   sessionManager: import('./session-manager.js').SessionManager;
+  recipe: import('./recipe.js').Recipe;
+  branchState: import('./commands.js').BranchState;
   userMessageCount: number;
   switchSession(id: string): Promise<void>;
 }
@@ -120,7 +122,9 @@ export async function runTui(app: AppContext): Promise<void> {
   const renderer = await createCliRenderer({ exitOnCtrlC: false });
 
   // Set terminal title
-  process.stdout.write('\x1b]0;Forking Knowledge Miner\x07');
+  const recipeName = app.recipe?.name ?? 'connectome-host';
+  const rootAgentName = app.recipe?.agent?.name ?? 'agent';
+  process.stdout.write(`\x1b]0;${recipeName}\x07`);
 
   const state: TuiState = {
     status: 'idle',
@@ -334,7 +338,7 @@ export async function runTui(app: AppContext): Promise<void> {
   }
 
   function loadSessionHistory() {
-    const agent = app.framework.getAgent('researcher');
+    const agent = app.framework.getAgent(rootAgentName);
     if (!agent) return;
     const cm = agent.getContextManager();
     const messages = cm.getAllMessages();
@@ -411,15 +415,15 @@ export async function runTui(app: AppContext): Promise<void> {
 
   // ── Fleet tree view ────────────────────────────────────────────────
 
-  const expandedNodes = new Set<string>(['researcher']);
+  const expandedNodes = new Set<string>([rootAgentName]);
   let fleetCursor = 0;
   /** Ordered list of node IDs in current rendering (for cursor navigation). */
   let visibleNodeIds: string[] = [];
 
   function buildFleetTree(): FleetNode {
     const root: FleetNode = {
-      name: 'researcher',
-      fullName: 'researcher',
+      name: rootAgentName,
+      fullName: rootAgentName,
       isResearcher: true,
       children: [],
     };
@@ -441,7 +445,7 @@ export async function runTui(app: AppContext): Promise<void> {
     // Build parent-child links
     for (const sa of state.subagents) {
       const parentFullName = agentParent.get(sa.name);
-      if (parentFullName && parentFullName !== 'researcher') {
+      if (parentFullName && parentFullName !== rootAgentName) {
         // Find the parent's short name
         const parentShort = [...byName.keys()].find(k => parentFullName.includes(k));
         if (parentShort && byName.has(parentShort)) {
@@ -520,7 +524,7 @@ export async function runTui(app: AppContext): Promise<void> {
     let compStr = '';
     if (node.isResearcher) {
       try {
-        const agent = app.framework.getAgent('researcher');
+        const agent = app.framework.getAgent(rootAgentName);
         const cm = agent?.getContextManager();
         const strategy = (cm as any)?.strategy as AutobiographicalStrategy | undefined;
         if (strategy?.getStats) {
@@ -571,7 +575,7 @@ export async function runTui(app: AppContext): Promise<void> {
     }
 
     // Synesthete summary
-    const fullName = node.isResearcher ? 'researcher'
+    const fullName = node.isResearcher ? rootAgentName
       : [...agentTranscripts.keys()].find(k => k.includes(node.name));
     if (fullName) {
       const summary = summaryCache.get(fullName);
@@ -756,9 +760,9 @@ export async function runTui(app: AppContext): Promise<void> {
 
     switch (event.type) {
       case 'inference:started': {
-        if (agent === 'researcher') {
+        if (agent === rootAgentName) {
           if (backgrounded) {
-            // Researcher is running in background — don't show stream UI
+            // Root agent is running in background — don't show stream UI
             state.status = 'background';
             streamOutputTokens = 0;
           } else {
@@ -775,11 +779,11 @@ export async function runTui(app: AppContext): Promise<void> {
       case 'inference:tokens': {
         const content = event.content as string;
         if (content) {
-          if (agent === 'researcher' && backgrounded) {
+          if (agent === rootAgentName && backgrounded) {
             // Silently accumulate tokens while backgrounded
             backgroundBuffer += content;
             streamOutputTokens += Math.ceil(content.length / 4);
-          } else if (agent === 'researcher' && streaming) {
+          } else if (agent === rootAgentName && streaming) {
             streamToken(content);
             streamOutputTokens += Math.ceil(content.length / 4);
             spinnerFrame = (spinnerFrame + 1) % SPINNER.length;
@@ -827,7 +831,7 @@ export async function runTui(app: AppContext): Promise<void> {
           }
         }
 
-        if (agent === 'researcher') {
+        if (agent === rootAgentName) {
           state.status = 'idle';
           state.tool = null;
           if (backgrounded) {
@@ -846,7 +850,7 @@ export async function runTui(app: AppContext): Promise<void> {
       }
 
       case 'inference:failed': {
-        if (agent === 'researcher') {
+        if (agent === rootAgentName) {
           state.status = 'error';
           if (backgrounded) {
             backgrounded = false;
@@ -887,7 +891,7 @@ export async function runTui(app: AppContext): Promise<void> {
           }
         }
 
-        if (agent === 'researcher') {
+        if (agent === rootAgentName) {
           state.status = backgrounded ? 'background' : 'tools';
           state.tool = names;
           if (streaming) endStream();
@@ -906,7 +910,7 @@ export async function runTui(app: AppContext): Promise<void> {
       }
 
       case 'inference:stream_resumed': {
-        if (agent === 'researcher') {
+        if (agent === rootAgentName) {
           state.status = 'thinking';
           state.tool = null;
           beginStream();
@@ -930,14 +934,14 @@ export async function runTui(app: AppContext): Promise<void> {
 
       case 'tool:started': {
         const tool = event.tool as string;
-        if (agent === 'researcher') {
+        if (agent === rootAgentName) {
           state.tool = tool;
           updateStatus();
         }
         // Show file operations in chat
         const toolInput = event.input as Record<string, unknown> | undefined;
-        if (toolInput && (agent === 'researcher' || verboseChat)) {
-          const short = agent === 'researcher' ? '' : `[${(agent ?? '').replace(/^(spawn|fork)-/, '').replace(/-\d+$/, '')}] `;
+        if (toolInput && (agent === rootAgentName || verboseChat)) {
+          const short = agent === rootAgentName ? '' : `[${(agent ?? '').replace(/^(spawn|fork)-/, '').replace(/-\d+$/, '')}] `;
           if (tool === 'files:write' && toolInput.filePath) {
             const fp = String(toolInput.filePath);
             addLine(`  ${short}write ${fp}`, DIM_GRAY);
@@ -964,12 +968,31 @@ export async function runTui(app: AppContext): Promise<void> {
       case 'tool:failed': {
         const tool = event.tool as string;
         const error = event.error as string;
-        if (agent === 'researcher') {
+        if (agent === rootAgentName) {
           addLine(`[tool error] ${tool}: ${error}`, RED);
         } else if (agent) {
           const short = agent.replace(/^(spawn|fork)-/, '').replace(/-\d+$/, '').replace(/-retry\d+$/, '');
           addLine(`  [${short}] tool error: ${tool}: ${error}`, RED);
         }
+        break;
+      }
+
+      case 'branches:changed': {
+        const branchEvent = event.event as string;
+        const branch = event.branch as string;
+        const previous = event.previous as string | undefined;
+        const source = event.source as string;
+
+        if (branchEvent === 'switched') {
+          addLine(`Branch switched: ${previous ?? '?'} → ${branch} (via ${source})`, CYAN);
+          resetBranchState(app.branchState);
+          refreshFromStore();
+        } else if (branchEvent === 'created') {
+          addLine(`Branch created: ${branch} (via ${source})`, CYAN);
+        } else if (branchEvent === 'deleted') {
+          addLine(`Branch deleted: ${branch} (via ${source})`, CYAN);
+        }
+        updateStatus();
         break;
       }
     }
@@ -1160,7 +1183,7 @@ export async function runTui(app: AppContext): Promise<void> {
       if (state.status !== 'idle' && state.status !== 'error') {
         // Cancel all subagents first so their results propagate up
         const cancelled = subMod?.cancelAll() ?? 0;
-        const agent = app.framework.getAgent('researcher');
+        const agent = app.framework.getAgent(rootAgentName);
         if (agent) {
           agent.cancelStream();
           if (streaming) endStream();
@@ -1212,12 +1235,12 @@ export async function runTui(app: AppContext): Promise<void> {
         }
       } else if (key.name === 'p') {
         const nodeId = visibleNodeIds[fleetCursor];
-        if (nodeId && nodeId !== 'researcher') {
+        if (nodeId && nodeId !== rootAgentName) {
           enterPeek(nodeId);
         }
       } else if (key.name === 'delete' || key.name === 'backspace') {
         const nodeId = visibleNodeIds[fleetCursor];
-        if (nodeId && nodeId !== 'researcher') {
+        if (nodeId && nodeId !== rootAgentName) {
           const sa = state.subagents.find(s => s.name === nodeId);
           if (sa?.status === 'running' && subMod) {
             if (subMod.cancelSubagent(nodeId)) {
@@ -1303,7 +1326,7 @@ export async function runTui(app: AppContext): Promise<void> {
   // ── Init ───────────────────────────────────────────────────────────
 
   const session = app.sessionManager.getActiveSession();
-  addLine('Forking Knowledge Miner. Type /help for commands.', GRAY);
+  addLine(`${recipeName}. Type /help for commands.`, GRAY);
   if (session) addLine(`Session: ${session.name}`, DIM_GRAY);
   addLine(`Error log: ${logPath}`, DIM_GRAY);
   app.framework.onTrace(onTrace as (e: unknown) => void);
