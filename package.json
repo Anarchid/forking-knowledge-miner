@@ -1,7 +1,7 @@
 {
-  "name": "forking-knowledge-miner",
-  "version": "0.2.0",
-  "description": "TUI-driven knowledge extraction using forking LLM agents",
+  "name": "connectome-host",
+  "version": "0.3.0",
+  "description": "General-purpose agent TUI host with recipe-based configuration",
   "type": "module",
   "scripts": {
     "start": "bun src/index.ts",

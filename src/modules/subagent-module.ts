@@ -547,7 +547,7 @@ export class SubagentModule implements Module {
       const elapsed = sa.completedAt
         ? Math.floor((sa.completedAt - sa.startedAt) / 1000)
         : Math.floor((Date.now() - sa.startedAt) / 1000);
-      const parent = this.parentMap.get(sa.name) ?? 'researcher';
+      const parent = this.parentMap.get(sa.name) ?? 'agent';
       const parentShort = parent.replace(/^(spawn|fork)-/, '').replace(/-d\d+-\d+$/, '').replace(/-retry\d+$/, '');
       const task = sa.task.length > 50 ? sa.task.slice(0, 47) + '...' : sa.task;
       lines.push(`  ${sa.name} [${sa.type}] ${sa.status} ${elapsed}s ${sa.toolCallsCount}calls parent:${parentShort} "${task}"`);
@@ -1036,7 +1036,7 @@ export class SubagentModule implements Module {
       };
     }
 
-    const parentAgentName = callerAgentName ?? this.config.parentAgentName ?? 'researcher';
+    const parentAgentName = callerAgentName ?? this.config.parentAgentName ?? 'agent';
 
     // Apply per-task timeout override if provided
     const savedMaxExecution = this.maxExecutionMs;
@@ -1077,7 +1077,7 @@ export class SubagentModule implements Module {
       };
     }
 
-    const parentAgentName = callerAgentName ?? this.config.parentAgentName ?? 'researcher';
+    const parentAgentName = callerAgentName ?? this.config.parentAgentName ?? 'agent';
 
     // Apply per-task timeout override if provided
     const savedMaxExecution = this.maxExecutionMs;

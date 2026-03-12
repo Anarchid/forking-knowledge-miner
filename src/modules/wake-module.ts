@@ -71,7 +71,7 @@ export class WakeModule implements Module {
   private onWake?: (subs: string[], summary: string) => void;
 
   constructor(opts?: { agentName?: string; onWake?: (subs: string[], summary: string) => void }) {
-    this.agentName = opts?.agentName ?? 'researcher';
+    this.agentName = opts?.agentName ?? 'agent';
     this.onWake = opts?.onWake;
   }
 

@@ -1,0 +1,228 @@
+/**
+ * Recipe system — config-driven agent bootstrapping.
+ *
+ * A recipe defines everything domain-specific about an agent session:
+ * system prompt, MCP servers, which modules to enable, and naming hints.
+ *
+ * Recipes can be loaded from:
+ *   - HTTP(S) URLs
+ *   - Local file paths
+ *   - Saved state from a previous run (data/.recipe.json)
+ *   - Built-in default (generic assistant)
+ */
+
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from 'node:fs';
+import { resolve } from 'node:path';
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+export interface RecipeStrategy {
+  type: 'autobiographical' | 'passthrough';
+  headWindowTokens?: number;
+  recentWindowTokens?: number;
+  compressionModel?: string;
+  maxMessageTokens?: number;
+}
+
+export interface RecipeAgent {
+  name?: string;
+  model?: string;
+  systemPrompt: string;
+  maxTokens?: number;
+  strategy?: RecipeStrategy;
+}
+
+export interface RecipeMcpServer {
+  command: string;
+  args?: string[];
+  env?: Record<string, string>;
+  toolPrefix?: string;
+}
+
+export interface RecipeModules {
+  subagents?: boolean | { defaultModel?: string };
+  lessons?: boolean;
+  retrieval?: boolean | { model?: string; maxInjected?: number };
+  wake?: boolean;
+  files?: boolean | { namespace?: string };
+}
+
+export interface Recipe {
+  name: string;
+  description?: string;
+  version?: string;
+  agent: RecipeAgent;
+  mcpServers?: Record<string, RecipeMcpServer>;
+  modules?: RecipeModules;
+  sessionNaming?: { examples?: string[] };
+}
+
+// ---------------------------------------------------------------------------
+// Default recipe
+// ---------------------------------------------------------------------------
+
+export const DEFAULT_RECIPE: Recipe = {
+  name: 'Agent',
+  description: 'General-purpose assistant with tool access',
+  agent: {
+    name: 'agent',
+    systemPrompt: [
+      'You are a helpful assistant. You have access to tools provided by connected MCP servers.',
+      'Use them to help the user with their tasks.',
+      '',
+      'You can fork subagents for parallel work, create persistent notes, and write files as products of your work.',
+    ].join('\n'),
+  },
+  modules: {
+    subagents: true,
+    lessons: true,
+    retrieval: true,
+    wake: true,
+    files: true,
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Loading
+// ---------------------------------------------------------------------------
+
+/**
+ * Load a recipe from a URL or local file path.
+ * If the systemPrompt value is an HTTP(S) URL, fetches the text.
+ */
+export async function loadRecipe(source: string): Promise<Recipe> {
+  let raw: unknown;
+
+  if (source.startsWith('http://') || source.startsWith('https://')) {
+    const res = await fetch(source);
+    if (!res.ok) throw new Error(`Failed to fetch recipe from ${source}: ${res.status} ${res.statusText}`);
+    raw = await res.json();
+  } else {
+    const path = resolve(source);
+    if (!existsSync(path)) throw new Error(`Recipe file not found: ${path}`);
+    raw = JSON.parse(readFileSync(path, 'utf-8'));
+  }
+
+  const recipe = validateRecipe(raw);
+  return resolveSystemPrompt(recipe);
+}
+
+/**
+ * If systemPrompt is an HTTP(S) URL, fetch its contents as plain text.
+ * Only treated as a URL if it looks like a single URL (no spaces/newlines).
+ */
+async function resolveSystemPrompt(recipe: Recipe): Promise<Recipe> {
+  const prompt = recipe.agent.systemPrompt;
+  const isUrl = (prompt.startsWith('http://') || prompt.startsWith('https://'))
+    && !prompt.includes(' ') && !prompt.includes('\n');
+  if (isUrl) {
+    const res = await fetch(prompt);
+    if (!res.ok) throw new Error(`Failed to fetch system prompt from ${prompt}: ${res.status} ${res.statusText}`);
+    return {
+      ...recipe,
+      agent: { ...recipe.agent, systemPrompt: await res.text() },
+    };
+  }
+  return recipe;
+}
+
+/**
+ * Validate raw JSON and fill defaults.
+ */
+export function validateRecipe(raw: unknown): Recipe {
+  if (!raw || typeof raw !== 'object') throw new Error('Recipe must be a JSON object');
+  const obj = raw as Record<string, unknown>;
+
+  if (typeof obj.name !== 'string' || !obj.name) {
+    throw new Error('Recipe must have a "name" string');
+  }
+  if (!obj.agent || typeof obj.agent !== 'object') {
+    throw new Error('Recipe must have an "agent" object');
+  }
+
+  const agent = obj.agent as Record<string, unknown>;
+  if (typeof agent.systemPrompt !== 'string' || !agent.systemPrompt) {
+    throw new Error('Recipe agent must have a "systemPrompt" string');
+  }
+
+  // Validate strategy type if present
+  if (agent.strategy) {
+    const strategy = agent.strategy as Record<string, unknown>;
+    if (strategy.type && strategy.type !== 'autobiographical' && strategy.type !== 'passthrough') {
+      throw new Error(`Invalid strategy type "${strategy.type}". Must be "autobiographical" or "passthrough".`);
+    }
+  }
+
+  // Validate mcpServers entries if present
+  if (obj.mcpServers && typeof obj.mcpServers === 'object') {
+    for (const [id, entry] of Object.entries(obj.mcpServers as Record<string, unknown>)) {
+      if (!entry || typeof entry !== 'object') {
+        throw new Error(`mcpServers.${id} must be an object`);
+      }
+      const server = entry as Record<string, unknown>;
+      if (typeof server.command !== 'string' || !server.command) {
+        throw new Error(`mcpServers.${id} must have a "command" string`);
+      }
+      if (server.args !== undefined && !Array.isArray(server.args)) {
+        throw new Error(`mcpServers.${id}.args must be an array`);
+      }
+    }
+  }
+
+  return obj as unknown as Recipe;
+}
+
+// ---------------------------------------------------------------------------
+// Persistence
+// ---------------------------------------------------------------------------
+
+function savedRecipePath(dataDir: string): string {
+  return resolve(dataDir, '.recipe.json');
+}
+
+export function saveRecipe(dataDir: string, recipe: Recipe): void {
+  mkdirSync(dataDir, { recursive: true });
+  writeFileSync(savedRecipePath(dataDir), JSON.stringify(recipe, null, 2) + '\n', 'utf-8');
+}
+
+export function loadSavedRecipe(dataDir: string): Recipe | null {
+  const path = savedRecipePath(dataDir);
+  if (!existsSync(path)) return null;
+  try {
+    const raw = JSON.parse(readFileSync(path, 'utf-8'));
+    return validateRecipe(raw);
+  } catch {
+    return null;
+  }
+}
+
+export function clearSavedRecipe(dataDir: string): void {
+  const path = savedRecipePath(dataDir);
+  if (existsSync(path)) {
+    unlinkSync(path);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// CLI helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse argv to find a recipe source. Returns null if none provided.
+ * Skips known flags (--no-tui, --no-recipe).
+ */
+export function parseRecipeArg(argv: string[]): { source: string | null; noRecipe: boolean } {
+  const noRecipe = argv.includes('--no-recipe');
+  let source: string | null = null;
+
+  for (const arg of argv.slice(2)) {
+    if (arg.startsWith('--')) continue;
+    // First positional arg is the recipe source
+    source = arg;
+    break;
+  }
+
+  return { source, noRecipe };
+}

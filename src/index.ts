@@ -1,45 +1,48 @@
 /**
- * Forking Knowledge Miner
- *
- * TUI-driven knowledge extraction using forking LLM agents.
+ * connectome-host — General-purpose agent TUI host with recipe-based configuration.
  *
  * Usage:
- *   bun src/index.ts            # OpenTUI mode (requires TTY)
- *   bun src/index.ts --no-tui   # Readline mode (works in pipes/CI)
+ *   bun src/index.ts                           # Start with saved/default recipe
+ *   bun src/index.ts <recipe-url-or-path>      # Load recipe from URL or file
+ *   bun src/index.ts --no-recipe               # Start fresh with default recipe
+ *   bun src/index.ts --no-tui                  # Readline mode (works in pipes/CI)
  *
  * Environment variables:
  *   ANTHROPIC_API_KEY   - Required
- *   ZULIP_MCP_CMD       - Path to Zulip MCP server (default: node ../zulip-mcp/build/index.js)
- *   ZULIP_RC_PATH       - Path to .zuliprc file (for Zulip MCP)
- *   MODEL               - Model to use (default: claude-opus-4-6)
+ *   MODEL               - Override model (default: from recipe or claude-opus-4-6)
  *   DATA_DIR            - Data directory for sessions (default: ./data)
  */
 
 import { Membrane, AnthropicAdapter, NativeFormatter } from 'membrane';
-import { AgentFramework, KnowledgeStrategy, FilesModule } from '@connectome/agent-framework';
-import { resolve, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { existsSync } from 'node:fs';
-import { SYSTEM_PROMPT } from './prompts/system.js';
+import { AgentFramework, AutobiographicalStrategy, PassthroughStrategy, FilesModule, type Module } from '@connectome/agent-framework';
+import { resolve } from 'node:path';
 import { SubagentModule } from './modules/subagent-module.js';
 import { LessonsModule } from './modules/lessons-module.js';
 import { RetrievalModule } from './modules/retrieval-module.js';
 import { WakeModule } from './modules/wake-module.js';
 import { LocalFilesModule } from './modules/local-files-module.js';
 import { TuiModule } from './modules/tui-module.js';
-import { loadMcplServers, saveMcplServers, DEFAULT_CONFIG_PATH } from './mcpl-config.js';
+import { loadMcplServers, DEFAULT_CONFIG_PATH } from './mcpl-config.js';
 import { SessionManager } from './session-manager.js';
 import { generateSessionName } from './synesthete.js';
+import {
+  type Recipe,
+  DEFAULT_RECIPE,
+  loadRecipe,
+  saveRecipe,
+  loadSavedRecipe,
+  clearSavedRecipe,
+  parseRecipeArg,
+} from './recipe.js';
+import { createBranchState, resetBranchState, type BranchState } from './commands.js';
 
 export type { AppContext };
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const noTui = process.argv.includes('--no-tui') || !process.stdin.isTTY;
 
 const config = {
   apiKey: process.env.ANTHROPIC_API_KEY,
-  model: process.env.MODEL || 'claude-opus-4-6',
+  model: process.env.MODEL,
   dataDir: process.env.DATA_DIR || './data',
 };
 
@@ -56,6 +59,8 @@ interface AppContext {
   framework: AgentFramework;
   membrane: Membrane;
   sessionManager: SessionManager;
+  recipe: Recipe;
+  branchState: BranchState;
   userMessageCount: number;
 
   /** Stop current framework, switch to a different session, start new framework. */
@@ -63,96 +68,171 @@ interface AppContext {
 }
 
 // ---------------------------------------------------------------------------
+// Recipe resolution
+// ---------------------------------------------------------------------------
+
+async function resolveRecipe(): Promise<Recipe> {
+  const { source, noRecipe } = parseRecipeArg(process.argv);
+
+  if (noRecipe) {
+    clearSavedRecipe(config.dataDir);
+    console.log('Starting with default recipe.');
+    return DEFAULT_RECIPE;
+  }
+
+  if (source) {
+    try {
+      const recipe = await loadRecipe(source);
+      saveRecipe(config.dataDir, recipe);
+      console.log(`Loaded recipe: ${recipe.name}${recipe.description ? ` — ${recipe.description}` : ''}`);
+      return recipe;
+    } catch (err) {
+      console.error(`Failed to load recipe from ${source}:`, err instanceof Error ? err.message : err);
+      process.exit(1);
+    }
+  }
+
+  // Try saved recipe
+  const saved = loadSavedRecipe(config.dataDir);
+  if (saved) {
+    console.log(`Resuming recipe: ${saved.name}`);
+    return saved;
+  }
+
+  return DEFAULT_RECIPE;
+}
+
+// ---------------------------------------------------------------------------
 // Framework factory
 // ---------------------------------------------------------------------------
 
-/**
- * Seed mcpl-servers.json on first run using legacy env vars.
- */
-function seedMcplConfig(): void {
-  if (existsSync(DEFAULT_CONFIG_PATH)) return;
+async function createFramework(membrane: Membrane, storePath: string, recipe: Recipe): Promise<AgentFramework> {
+  const agentName = recipe.agent.name || 'agent';
+  const model = config.model || recipe.agent.model || 'claude-opus-4-6';
+  const modules = recipe.modules ?? {};
 
-  const cmd = process.env.ZULIP_MCP_CMD || 'node';
-  const args = process.env.ZULIP_MCP_ARGS?.split(' ')
-    || [resolve(__dirname, '../../zulip_mcp/build/index.js')];
-  const zuliprc = process.env.ZULIP_RC_PATH || resolve(process.cwd(), '.zuliprc');
+  // -- Build module list --
+  // Always-on modules (not recipe-controlled)
+  const moduleInstances: Module[] = [new TuiModule(), new LocalFilesModule()];
 
-  const env: Record<string, string> = {
-    ENABLE_ZULIP: 'true',
-    ENABLE_DISCORD: 'false',
-  };
-  if (zuliprc) env.ZULIP_RC_PATH = zuliprc;
+  // Subagents
+  let subagentModule: SubagentModule | null = null;
+  if (modules.subagents !== false) {
+    const subagentConfig = typeof modules.subagents === 'object' ? modules.subagents : {};
+    subagentModule = new SubagentModule({
+      parentAgentName: agentName,
+      defaultModel: subagentConfig.defaultModel || model,
+      defaultMaxTokens: 4096,
+    });
+    moduleInstances.push(subagentModule);
+  }
 
-  saveMcplServers(DEFAULT_CONFIG_PATH, {
-    zulip: { command: cmd, args, env },
-  });
-}
+  // Lessons
+  let lessonsModule: LessonsModule | null = null;
+  if (modules.lessons !== false) {
+    lessonsModule = new LessonsModule();
+    moduleInstances.push(lessonsModule);
+  }
 
-async function createFramework(membrane: Membrane, storePath: string): Promise<AgentFramework> {
-  seedMcplConfig();
-  const mcplServers = loadMcplServers(DEFAULT_CONFIG_PATH);
+  // Retrieval (requires lessons)
+  if (modules.retrieval !== false && lessonsModule) {
+    const retrievalConfig = typeof modules.retrieval === 'object' ? modules.retrieval : {};
+    moduleInstances.push(new RetrievalModule({
+      membrane,
+      retrievalModel: retrievalConfig.model,
+      maxInjectedLessons: retrievalConfig.maxInjected,
+    }));
+  }
 
-  const subagentModule = new SubagentModule({
-    parentAgentName: 'researcher',
-    defaultModel: config.model,
-    defaultMaxTokens: 4096,
-  });
-  const lessonsModule = new LessonsModule();
-  const retrievalModule = new RetrievalModule({ membrane });
-  const filesModule = new FilesModule({ namespace: 'products' });
-  const localFilesModule = new LocalFilesModule();
-
-  // WakeModule — onWake callback wired after framework creation
+  // Wake
+  let wakeModule: WakeModule | null = null;
   let emitWakeTrace: ((subs: string[], summary: string) => void) | undefined;
-  const wakeModule = new WakeModule({
-    agentName: 'researcher',
-    onWake: (subs, summary) => emitWakeTrace?.(subs, summary),
-  });
+  if (modules.wake !== false) {
+    wakeModule = new WakeModule({
+      agentName,
+      onWake: (subs, summary) => emitWakeTrace?.(subs, summary),
+    });
+    moduleInstances.push(wakeModule);
+  }
 
-  // Augment MCPL server configs with wake filtering
-  const augmentedServers = mcplServers.map(server => ({
+  // Files
+  let filesModule: FilesModule | null = null;
+  if (modules.files !== false) {
+    const filesConfig = typeof modules.files === 'object' ? modules.files : {};
+    filesModule = new FilesModule({ namespace: filesConfig.namespace || 'files' });
+    moduleInstances.push(filesModule);
+  }
+
+  // -- Build MCP server list (recipe + file, file wins on conflict) --
+  const recipeServers = recipe.mcpServers ?? {};
+  const fileServers = loadMcplServers(DEFAULT_CONFIG_PATH);
+  const fileServerIds = new Set(fileServers.map(s => s.id));
+
+  // Convert recipe servers to LoadedServerConfig shape
+  const recipeServerList = Object.entries(recipeServers)
+    .filter(([id]) => !fileServerIds.has(id)) // file wins on conflict
+    .map(([id, entry]) => ({ id, ...entry }));
+
+  const allServers = [...recipeServerList, ...fileServers];
+
+  // Augment with wake filtering if wake module is active
+  const augmentedServers = allServers.map(server => ({
     ...server,
-    shouldTriggerInference: wakeModule.shouldTrigger,
+    ...(wakeModule ? { shouldTriggerInference: wakeModule.shouldTrigger } : {}),
   }));
 
+  // -- Build strategy --
+  const strategyConfig = recipe.agent.strategy;
+  const strategyType = strategyConfig?.type ?? 'autobiographical';
+  const strategy = strategyType === 'passthrough'
+    ? new PassthroughStrategy()
+    : new AutobiographicalStrategy({
+        headWindowTokens: strategyConfig?.headWindowTokens ?? 4000,
+        recentWindowTokens: strategyConfig?.recentWindowTokens ?? 30000,
+        compressionModel: strategyConfig?.compressionModel ?? model,
+        autoTickOnNewMessage: true,
+        maxMessageTokens: strategyConfig?.maxMessageTokens ?? 10000,
+      });
+
+  // -- Create framework --
   const framework = await AgentFramework.create({
     storePath,
     membrane,
     agents: [
       {
-        name: 'researcher',
-        model: config.model,
-        systemPrompt: SYSTEM_PROMPT,
-        maxTokens: 16384,
-        strategy: new KnowledgeStrategy({
-          headWindowTokens: 4000,
-          recentWindowTokens: 30000,
-          compressionModel: config.model,
-          autoTickOnNewMessage: true,
-          maxMessageTokens: 10000,
-        }),
+        name: agentName,
+        model,
+        systemPrompt: recipe.agent.systemPrompt,
+        maxTokens: recipe.agent.maxTokens ?? 16384,
+        strategy,
       },
     ],
-    modules: [new TuiModule(), subagentModule, lessonsModule, retrievalModule, wakeModule, filesModule, localFilesModule],
+    modules: moduleInstances,
     mcplServers: augmentedServers,
   });
 
-  // Wire onWake → framework trace emission
-  emitWakeTrace = (subs, summary) => {
-    // Emit as a custom trace event via pushEvent (process:received trace)
-    // TUI picks this up via the onTrace listener
-    framework.pushEvent({
-      type: 'external-message',
-      source: 'wake:triggered',
-      content: summary,
-      metadata: { subscriptions: subs, eventSummary: summary },
-      triggerInference: false,
-    } as any);
-  };
+  // Wire post-creation hooks
+  if (wakeModule) {
+    emitWakeTrace = (subs, summary) => {
+      framework.pushEvent({
+        type: 'external-message',
+        source: 'wake:triggered',
+        content: summary,
+        metadata: { subscriptions: subs, eventSummary: summary },
+        triggerInference: false,
+      } as any);
+    };
+    wakeModule.setFramework(framework);
+  }
 
-  subagentModule.setFramework(framework);
-  wakeModule.setFramework(framework);
-  filesModule.initStore(framework.getStore());
+  if (subagentModule) {
+    subagentModule.setFramework(framework);
+  }
+
+  if (filesModule) {
+    filesModule.initStore(framework.getStore());
+  }
+
   return framework;
 }
 
@@ -161,6 +241,9 @@ async function createFramework(membrane: Membrane, storePath: string): Promise<A
 // ---------------------------------------------------------------------------
 
 function setupSynesthete(app: AppContext): void {
+  const agentName = app.recipe.agent.name || 'agent';
+  const namingExamples = app.recipe.sessionNaming?.examples;
+
   app.framework.onTrace((event) => {
     if (event.type !== 'message:added') return;
     const e = event as unknown as { source: string };
@@ -172,8 +255,7 @@ function setupSynesthete(app: AppContext): void {
     const session = app.sessionManager.getActiveSession();
     if (!session || session.manuallyNamed) return;
 
-    // Fire-and-forget: generate name in background
-    const agent = app.framework.getAgent('researcher');
+    const agent = app.framework.getAgent(agentName);
     const cm = agent?.getContextManager();
     if (!cm) return;
 
@@ -190,7 +272,7 @@ function setupSynesthete(app: AppContext): void {
       })
       .join('\n');
 
-    generateSessionName(app.membrane, summary).then(name => {
+    generateSessionName(app.membrane, summary, namingExamples).then(name => {
       if (name) {
         app.sessionManager.renameSession(session.id, name, false);
       }
@@ -290,7 +372,7 @@ async function runPiped(app: AppContext) {
 
   // Interactive TTY readline (fallback if --no-tui is explicit on a TTY)
   const rl = createInterface({ input: process.stdin, output: process.stdout, prompt: '> ' });
-  console.log('Forking Knowledge Miner (readline mode). Type /help for commands.');
+  console.log('connectome-host (readline mode). Type /help for commands.');
   rl.prompt();
   rl.on('line', async (line: string) => {
     if (await processLine(line)) { rl.close(); return; }
@@ -306,6 +388,8 @@ async function runPiped(app: AppContext) {
 // ---------------------------------------------------------------------------
 
 async function main() {
+  const recipe = await resolveRecipe();
+
   const adapter = new AnthropicAdapter({ apiKey: config.apiKey! });
   const membrane = new Membrane(adapter, { formatter: new NativeFormatter() });
 
@@ -319,22 +403,25 @@ async function main() {
   }
 
   const storePath = sessionManager.getStorePath(activeSession.id);
-  const framework = await createFramework(membrane, storePath);
+  const framework = await createFramework(membrane, storePath, recipe);
 
   // Build app context
   const app: AppContext = {
     framework,
     membrane,
     sessionManager,
+    recipe,
+    branchState: createBranchState(),
     userMessageCount: 0,
 
     async switchSession(id: string) {
       await this.framework.stop();
       sessionManager.setActiveSession(id);
       const newStorePath = sessionManager.getStorePath(id);
-      this.framework = await createFramework(membrane, newStorePath);
+      this.framework = await createFramework(membrane, newStorePath, recipe);
       this.framework.start();
       this.userMessageCount = 0;
+      resetBranchState(this.branchState);
       setupSynesthete(this);
     },
   };
