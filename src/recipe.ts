@@ -35,10 +35,20 @@ export interface RecipeAgent {
 }
 
 export interface RecipeMcpServer {
-  command: string;
+  /** Command to spawn (stdio transport). Mutually exclusive with url. */
+  command?: string;
   args?: string[];
   env?: Record<string, string>;
+  /** WebSocket URL (WebSocket transport). Mutually exclusive with command. */
+  url?: string;
+  transport?: 'stdio' | 'websocket';
+  /** Bearer token for WebSocket auth (appended as ?token= query param). */
+  token?: string;
   toolPrefix?: string;
+  enabledFeatureSets?: string[];
+  disabledFeatureSets?: string[];
+  reconnect?: boolean;
+  reconnectIntervalMs?: number;
 }
 
 export interface RecipeModules {
@@ -162,8 +172,10 @@ export function validateRecipe(raw: unknown): Recipe {
         throw new Error(`mcpServers.${id} must be an object`);
       }
       const server = entry as Record<string, unknown>;
-      if (typeof server.command !== 'string' || !server.command) {
-        throw new Error(`mcpServers.${id} must have a "command" string`);
+      const hasCommand = typeof server.command === 'string' && server.command;
+      const hasUrl = typeof server.url === 'string' && server.url;
+      if (!hasCommand && !hasUrl) {
+        throw new Error(`mcpServers.${id} must have a "command" string (stdio) or "url" string (websocket)`);
       }
       if (server.args !== undefined && !Array.isArray(server.args)) {
         throw new Error(`mcpServers.${id}.args must be an array`);
