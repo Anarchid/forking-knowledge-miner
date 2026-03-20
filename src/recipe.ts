@@ -51,12 +51,20 @@ export interface RecipeMcpServer {
   reconnectIntervalMs?: number;
 }
 
+export interface RecipeWorkspaceMount {
+  name: string;
+  path: string;
+  mode?: 'read-write' | 'read-only';
+  watch?: 'always' | 'on-agent-action' | 'never';
+  ignore?: string[];
+}
+
 export interface RecipeModules {
   subagents?: boolean | { defaultModel?: string };
   lessons?: boolean;
   retrieval?: boolean | { model?: string; maxInjected?: number };
   wake?: boolean;
-  files?: boolean | { namespace?: string };
+  workspace?: boolean | { mounts: RecipeWorkspaceMount[] };
 }
 
 export interface Recipe {
@@ -90,7 +98,7 @@ export const DEFAULT_RECIPE: Recipe = {
     lessons: true,
     retrieval: true,
     wake: true,
-    files: true,
+    workspace: true,
   },
 };
 

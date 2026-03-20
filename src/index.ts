@@ -14,13 +14,13 @@
  */
 
 import { Membrane, AnthropicAdapter, NativeFormatter } from 'membrane';
-import { AgentFramework, AutobiographicalStrategy, PassthroughStrategy, FilesModule, type Module } from '@connectome/agent-framework';
+import { AgentFramework, AutobiographicalStrategy, PassthroughStrategy, WorkspaceModule, type Module, type WorkspaceConfig, type MountConfig } from '@connectome/agent-framework';
 import { resolve } from 'node:path';
 import { SubagentModule } from './modules/subagent-module.js';
 import { LessonsModule } from './modules/lessons-module.js';
 import { RetrievalModule } from './modules/retrieval-module.js';
 import { WakeModule } from './modules/wake-module.js';
-import { LocalFilesModule } from './modules/local-files-module.js';
+import type { RecipeWorkspaceMount } from './recipe.js';
 import { TuiModule } from './modules/tui-module.js';
 import { loadMcplServers, DEFAULT_CONFIG_PATH } from './mcpl-config.js';
 import { SessionManager } from './session-manager.js';
@@ -112,8 +112,7 @@ async function createFramework(membrane: Membrane, storePath: string, recipe: Re
   const modules = recipe.modules ?? {};
 
   // -- Build module list --
-  // Always-on modules (not recipe-controlled)
-  const moduleInstances: Module[] = [new TuiModule(), new LocalFilesModule()];
+  const moduleInstances: Module[] = [new TuiModule()];
 
   // Subagents
   let subagentModule: SubagentModule | null = null;
@@ -155,12 +154,27 @@ async function createFramework(membrane: Membrane, storePath: string, recipe: Re
     moduleInstances.push(wakeModule);
   }
 
-  // Files
-  let filesModule: FilesModule | null = null;
-  if (modules.files !== false) {
-    const filesConfig = typeof modules.files === 'object' ? modules.files : {};
-    filesModule = new FilesModule({ namespace: filesConfig.namespace || 'files' });
-    moduleInstances.push(filesModule);
+  // Workspace (replaces FilesModule + LocalFilesModule)
+  let workspaceModule: WorkspaceModule | null = null;
+  if (modules.workspace !== false) {
+    let mounts: MountConfig[];
+    if (typeof modules.workspace === 'object' && modules.workspace.mounts) {
+      mounts = modules.workspace.mounts.map((m: RecipeWorkspaceMount) => ({
+        name: m.name,
+        path: resolve(m.path),
+        mode: m.mode ?? 'read-write',
+        watch: m.watch ?? 'never',
+        ignore: m.ignore ?? [],
+      }));
+    } else {
+      // Default: read-only local mount + read-write files mount
+      mounts = [
+        { name: 'local', path: resolve('.'), mode: 'read-only' as const, watch: 'never' as const },
+        { name: 'files', path: resolve('./output'), mode: 'read-write' as const, watch: 'never' as const },
+      ];
+    }
+    workspaceModule = new WorkspaceModule({ mounts });
+    moduleInstances.push(workspaceModule);
   }
 
   // -- Build MCP server list (recipe + file, file wins on conflict) --
@@ -229,8 +243,8 @@ async function createFramework(membrane: Membrane, storePath: string, recipe: Re
     subagentModule.setFramework(framework);
   }
 
-  if (filesModule) {
-    filesModule.initStore(framework.getStore());
+  if (workspaceModule) {
+    workspaceModule.initStore(framework.getStore());
   }
 
   return framework;
