@@ -2,7 +2,7 @@
 
 A general-purpose agent TUI host with recipe-based configuration. Point it at any use case by loading a recipe — a JSON file that defines the system prompt, MCP servers, modules, and agent settings.
 
-Built on the Connectome stack: [agent-framework](https://github.com/Anarchid/agent-framework) + [context-manager](https://github.com/Anarchid/context-manager) + [chronicle](https://github.com/Anarchid/chronicle) + [membrane](https://github.com/Anarchid/membrane).
+Built on the Connectome stack: [@animalabs/agent-framework](https://github.com/anima-research/agent-framework) + [@animalabs/context-manager](https://github.com/anima-research/context-manager) + [@animalabs/chronicle](https://github.com/anima-research/chronicle) + [@animalabs/membrane](https://github.com/anima-research/membrane).
 
 ## Quick start
 
@@ -86,7 +86,10 @@ Recipe servers merge with `mcpl-servers.json`. The file wins on conflict, so use
 
 | Recipe | Description |
 |--------|-------------|
-| [`recipes/zulip-miner.json`](recipes/zulip-miner.json) | Knowledge extraction from Zulip workspaces using forking agents |
+| [`recipes/zulip-miner.json`](recipes/zulip-miner.json) | Knowledge extraction from Zulip workspaces |
+| [`recipes/knowledge-miner.json`](recipes/knowledge-miner.json) | Multi-source extraction from Zulip + Notion + GitLab |
+
+See [`recipes/SETUP.md`](recipes/SETUP.md) for a detailed setup guide for the knowledge-miner recipe.
 
 ## What it provides
 
@@ -100,21 +103,13 @@ Recipe servers merge with `mcpl-servers.json`. The file wins on conflict, so use
 
 ## Prerequisites
 
-- [Bun](https://bun.sh/) runtime
-- [Rust toolchain](https://rustup.rs/) (for Chronicle N-API bindings)
+- [Node.js](https://nodejs.org/) 20+ and [Bun](https://bun.sh/) runtime
 - An Anthropic API key
-
-### Build Chronicle
-
-```bash
-git clone https://github.com/Anarchid/chronicle.git ../chronicle
-cd ../chronicle && npm install && npm run build && cd -
-```
 
 ### Install
 
 ```bash
-bun install
+npm install
 ```
 
 ## Environment variables
@@ -142,6 +137,7 @@ bun --watch src/index.ts            # Dev mode
 | `/recipe` | Show current recipe info |
 | `/status` | Show agent state, branch, queue depth |
 | `/lessons` | Show lesson library sorted by confidence |
+| `/newtopic [context]` | Reset context window for a new topic |
 | `/clear` | Clear conversation display |
 | `/undo` | Revert to state before last agent turn |
 | `/redo` | Re-apply undone action |
@@ -186,8 +182,8 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed technical documentation.
 
 | Package | Source | Role |
 |---------|--------|------|
-| `@connectome/agent-framework` | [Anarchid/agent-framework](https://github.com/Anarchid/agent-framework) | Event-driven agent orchestration |
-| `@connectome/context-manager` | [Anarchid/context-manager](https://github.com/Anarchid/context-manager) | Context window management and compression |
-| `chronicle` | [Anarchid/chronicle](https://github.com/Anarchid/chronicle) | Branchable event store (Rust + N-API) |
-| `membrane` | [Anarchid/membrane](https://github.com/Anarchid/membrane) | LLM provider abstraction |
+| `@animalabs/agent-framework` | [npm](https://www.npmjs.com/package/@animalabs/agent-framework) | Event-driven agent orchestration |
+| `@animalabs/context-manager` | [npm](https://www.npmjs.com/package/@animalabs/context-manager) | Context window management and compression |
+| `@animalabs/chronicle` | [npm](https://www.npmjs.com/package/@animalabs/chronicle) | Branchable event store (Rust + N-API) |
+| `@animalabs/membrane` | [npm](https://www.npmjs.com/package/@animalabs/membrane) | LLM provider abstraction |
 | `@opentui/core` | [npm](https://www.npmjs.com/package/@opentui/core) | Terminal UI (Zig native core) |
